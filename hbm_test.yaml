@@ -1,0 +1,37 @@
+Frontend:
+  impl: SimpleO3
+  clock_ratio: 4
+  num_expected_insts: 500000
+  traces:
+    - example_inst.trace
+
+  Translation:
+    impl: RandomTranslation
+    max_addr: 2147483648
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 2
+
+  DRAM:
+    impl: HBM2
+    org:
+      preset: HBM2_8Gb
+      channel: 1
+      pseudochannel: 2
+    timing:
+      preset: HBM2_2Gbps
+
+  Controller:
+    impl: Generic
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: NoRefresh
+    RowPolicy:
+      impl: OpenRowPolicy 
+      cap: 4
+    plugins:
+
+  AddrMapper:
+    impl: ChRaBaRoCo

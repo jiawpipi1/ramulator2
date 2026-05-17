@@ -22,6 +22,7 @@ target_sources(
   impl/scheduler/prac_scheduler.cpp
 
   impl/refresh/all_bank_refresh.cpp
+  impl/refresh/no_refresh.cpp
   
   impl/rowpolicy/basic_rowpolicies.cpp
 
