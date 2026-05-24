@@ -1,0 +1,34 @@
+Frontend:
+  impl: LoadStoreTrace
+  clock_ratio: 4
+  path: hbm_test.trace
+
+  Translation:
+    impl: RandomTranslation
+    max_addr: 2147483648   # 先保持原本 2GB，等 repair 整合後再調
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 2
+
+  DRAM:
+    impl: HBM3
+    org:
+      preset: HBM3_8Gb       # 定義在 HBM3.cpp: {8<<10, 128, {1,2,4,4,1<<15,1<<6}}
+      channel: 1
+      pseudochannel: 2
+    timing:
+      preset: HBM3_2Gbps     # HBM3.cpp 裡唯一有的 timing preset
+
+  Controller:
+    impl: Generic
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: NoRefresh
+    RowPolicy:
+      impl: OpenRowPolicy
+    plugins:
+
+  AddrMapper:
+    impl: ChRaBaRoCo
