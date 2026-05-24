@@ -87,8 +87,9 @@ int main(int argc, char* argv[]) {
   std::string repair_path = "";
   bool debug_repair = program.get<bool>("--debug-repair");
 
-  if (config["repair_table_path"]) {
-    repair_path = config["repair_table_path"].as<std::string>();
+  if (config["MemorySystem"] && config["MemorySystem"]["Controller"]
+    && config["MemorySystem"]["Controller"]["repair_table_path"]) {
+    repair_path = config["MemorySystem"]["Controller"]["repair_table_path"].as<std::string>();
   }
 
   if (!repair_path.empty()) {

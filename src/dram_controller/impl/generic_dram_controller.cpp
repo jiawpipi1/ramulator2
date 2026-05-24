@@ -1,5 +1,7 @@
 #include "dram_controller/controller.h"
 #include "memory_system/memory_system.h"
+#include "dram_controller/impl/repair/repair_translator.h"
+#include "dram_controller/impl/repair/repair_table.h"
 
 namespace Ramulator {
 
@@ -48,16 +50,15 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
     size_t s_read_latency = 0;
     float s_avg_read_latency = 0;
-
+    // [ADD] Repair stats
     std::unique_ptr<RepairTranslator> m_repair_translator;
     int m_sram_read_latency = 6;  // 保留但不用於 timing，只供統計參考
-
-    // [ADD] Repair stats
     size_t s_repair_none    = 0;
     size_t s_repair_layer_a = 0;
     size_t s_repair_layer_b = 0;
     size_t s_repair_layer_c = 0;
     size_t s_repair_layer_d = 0;
+    HbmRepairTable m_repair_table;  
 
 
   public:
@@ -77,8 +78,11 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       }
       // add
       if (auto path = param<std::string>("repair_table_path").optional()) {
-          HbmRepairTable tbl = load_repair_table(*path);
-          m_repair_translator = std::make_unique<RepairTranslator>(tbl);
+        if (!HbmRepairTable::load_from_json(*path, m_repair_table)) {  // ← 用 member
+            spdlog::error("Failed to load repair table: {}", *path);
+        } else {
+            m_repair_translator = std::make_unique<RepairTranslator>(m_repair_table);
+        }
       }
     };
 
