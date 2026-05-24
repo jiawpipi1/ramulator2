@@ -1,9 +1,7 @@
 Frontend:
-  impl: SimpleO3
+  impl: LoadStoreTrace
   clock_ratio: 4
-  num_expected_insts: 500000
-  traces:
-    - example_inst.trace
+  path: hbm_test.trace
 
   Translation:
     impl: RandomTranslation
@@ -29,8 +27,7 @@ MemorySystem:
     RefreshManager:
       impl: NoRefresh
     RowPolicy:
-      impl: OpenRowPolicy 
-      cap: 4
+      impl: OpenRowPolicy
     plugins:
 
   AddrMapper:
