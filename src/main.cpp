@@ -8,6 +8,7 @@
 #include "base/config.h"
 #include "frontend/frontend.h"
 #include "memory_system/memory_system.h"
+#include "dram_controller/impl/repair/repair_table.h" 
 #include "example/example_ifce.h"
 
 int main(int argc, char* argv[]) {
@@ -20,6 +21,10 @@ int main(int argc, char* argv[]) {
   program.add_argument("-p", "--param").metavar("KEY=VALUE")
     .append()
     .help("Specify parameter to override in the configuration file. Repeat this option to change multiple parameters.");
+  program.add_argument("--debug-repair")
+    .help("Print detailed repair table contents after loading.")
+    .default_value(false)
+    .implicit_value(true);
 
   try {
     program.parse_args(argc, argv);
@@ -77,7 +82,29 @@ int main(int argc, char* argv[]) {
   } else if (use_yaml_file) {
     config = Ramulator::Config::parse_config_file(config_file_path, params);
   }
+  //Repair table load check 
+  Ramulator::HbmRepairTable repair_tbl;
+  std::string repair_path = "";
+  bool debug_repair = program.get<bool>("--debug-repair");
 
+  if (config["repair_table_path"]) {
+    repair_path = config["repair_table_path"].as<std::string>();
+  }
+
+  if (!repair_path.empty()) {
+    if (Ramulator::HbmRepairTable::load_from_json(repair_path, repair_tbl)) {
+      if (debug_repair) {
+        repair_tbl.print_detail();   // ¸Ô²Óª©
+      } else {
+        repair_tbl.print_summary();  // ¥u¦LºK­n
+      }
+    } else {
+      spdlog::error("Failed to load repair table from: {}", repair_path);
+    }
+  } else {
+    spdlog::warn("No repair_table_path specified. Repair table skipped.");
+  }
+  ///
   // Instaniate the frontend of the simulated system, this is one of the top-level objects in Ramulator 2.0.
   // It also recursively instaniate all components in the frontend.
   auto frontend = Ramulator::Factory::create_frontend(config);

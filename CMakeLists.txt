@@ -65,6 +65,7 @@ message("Done configuring argparse.")
 ##################################
 
 include_directories(${CMAKE_SOURCE_DIR}/src)
+include_directories(${CMAKE_SOURCE_DIR}/ext)
 
 add_library(ramulator SHARED)
 set_target_properties(ramulator PROPERTIES

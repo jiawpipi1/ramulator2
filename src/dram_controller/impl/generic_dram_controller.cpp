@@ -49,6 +49,16 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     size_t s_read_latency = 0;
     float s_avg_read_latency = 0;
 
+    std::unique_ptr<RepairTranslator> m_repair_translator;
+    int m_sram_read_latency = 6;  // 保留但不用於 timing，只供統計參考
+
+    // [ADD] Repair stats
+    size_t s_repair_none    = 0;
+    size_t s_repair_layer_a = 0;
+    size_t s_repair_layer_b = 0;
+    size_t s_repair_layer_c = 0;
+    size_t s_repair_layer_d = 0;
+
 
   public:
     void init() override {
@@ -64,6 +74,11 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         for (YAML::iterator it = plugin_configs.begin(); it != plugin_configs.end(); ++it) {
           m_plugins.push_back(create_child_ifce<IControllerPlugin>(*it));
         }
+      }
+      // add
+      if (auto path = param<std::string>("repair_table_path").optional()) {
+          HbmRepairTable tbl = load_repair_table(*path);
+          m_repair_translator = std::make_unique<RepairTranslator>(tbl);
       }
     };
 
@@ -87,7 +102,12 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       register_stat(s_write_row_hits).name("write_row_hits_{}", m_channel_id);
       register_stat(s_write_row_misses).name("write_row_misses_{}", m_channel_id);
       register_stat(s_write_row_conflicts).name("write_row_conflicts_{}", m_channel_id);
-
+      // [ADD]
+      register_stat(s_repair_none   ).name("repair_none_{}",    m_channel_id);
+      register_stat(s_repair_layer_a).name("repair_layer_a_{}", m_channel_id);
+      register_stat(s_repair_layer_b).name("repair_layer_b_{}", m_channel_id);
+      register_stat(s_repair_layer_c).name("repair_layer_c_{}", m_channel_id);
+      register_stat(s_repair_layer_d).name("repair_layer_d_{}", m_channel_id);
       for (size_t core_id = 0; core_id < m_num_cores; core_id++) {
         register_stat(s_read_row_hits_per_core[core_id]).name("read_row_hits_core_{}", core_id);
         register_stat(s_read_row_misses_per_core[core_id]).name("read_row_misses_core_{}", core_id);
@@ -111,6 +131,20 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     };
 
     bool send(Request& req) override {
+      // [ADD] Repair translation：只改 addr_vec，timing 完全不動
+      // Layer A 也一樣：addr_vec 換到 SRAM 對應位置，走正常 DRAM pipeline
+      if (m_repair_translator) {
+          RepairType rtype = m_repair_translator->translate(req.addr_vec);
+          switch (rtype) {
+              case RepairType::NONE:    s_repair_none++;    break;
+              case RepairType::LAYER_A: s_repair_layer_a++; break;  // addr已換，繼續走
+              case RepairType::LAYER_B: s_repair_layer_b++; break;
+              case RepairType::LAYER_C: s_repair_layer_c++; break;
+              case RepairType::LAYER_D: s_repair_layer_d++; break;
+          }
+          // 所有 layer 都繼續往下走，不 return，不改 depart
+      }
+      // [ADD END]
       req.final_command = m_dram->m_request_translations(req.type_id);
 
       switch (req.type_id) {

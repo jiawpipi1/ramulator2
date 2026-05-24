@@ -14,6 +14,7 @@ target_sources(
   impl/dummy_controller.cpp
   impl/generic_dram_controller.cpp
   impl/prac_dram_controller.cpp
+  impl/repair/repair_table.cpp 
   
   impl/scheduler/bh_scheduler.cpp
   impl/scheduler/blocking_scheduler.cpp
