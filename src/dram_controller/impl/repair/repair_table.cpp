@@ -48,18 +48,17 @@ bool HbmRepairTable::load_from_json(const std::string& path, HbmRepairTable& out
   out.K      = j.value("K",      0);
 
   // ── Table 1: Layer D bad banks ─────────────────────────────────────────────
-  // JSON: "layer_d_bad_banks": [[ch, ly, bk], ...]
   if (j.contains("layer_d_bad_banks")) {
     for (auto& entry : j["layer_d_bad_banks"]) {
-        int ch = entry["ch"].get<int>();   // ← 改成用 key 取值
-        int ly = entry["ly"].get<int>();
-        int bk = entry["bk"].get<int>();
-        out.bad_bank_set.insert({ch, ly, bk});
+      int ch  = entry["ch"].get<int>();
+      int ly  = entry["ly"].get<int>();
+      int bk  = entry["bk"].get<int>();
+      int pch = ly_to_pch(ly);          // ← ly 轉 pch
+      out.bad_bank_set.insert({ch, pch, bk});
     }
   }
 
   // ── Table 2: Layer A SRAM full-row map ────────────────────────────────────
-  // JSON: "layer_a_sram": [{"ch":…,"ly":…,"bk":…,"row":…,"sram_slot":…}, …]
   if (j.contains("layer_a_sram")) {
     for (auto& entry : j["layer_a_sram"]) {
       int ch   = entry["ch"].get<int>();
@@ -67,27 +66,25 @@ bool HbmRepairTable::load_from_json(const std::string& path, HbmRepairTable& out
       int bk   = entry["bk"].get<int>();
       int row  = entry["row"].get<int>();
       int slot = entry["sram_slot"].get<int>();
-      out.sram_full_map[{ch, ly, bk, row}] = slot;
+      int pch  = ly_to_pch(ly);          // ← ly 轉 pch
+      out.sram_full_map[{ch, pch, bk, row}] = slot;
     }
   }
 
   // ── Tables 3 & 4: per-bank Layer B + Layer C ──────────────────────────────
-  // JSON: "banks": [{"ch":…,"ly":…,"bk":…,
-  //                  "layer_b_ded_rows":[row,…],
-  //                  "layer_c_burst":[{…},…]}, …]
   if (j.contains("banks")) {
     for (auto& bank_entry : j["banks"]) {
-      int ch = bank_entry["ch"].get<int>();
-      int ly = bank_entry["ly"].get<int>();
-      int bk = bank_entry["bk"].get<int>();
+      int ch  = bank_entry["ch"].get<int>();
+      int ly  = bank_entry["ly"].get<int>();
+      int bk  = bank_entry["bk"].get<int>();
+      int pch = ly_to_pch(ly);           // ← ly 轉 pch
 
       // Table 3: Layer B — DED rows
-      // offset 0 → spare row 0, offset 1 → spare row 1
       if (bank_entry.contains("layer_b_ded_rows")) {
         int offset = 0;
         for (auto& row_val : bank_entry["layer_b_ded_rows"]) {
           int row = row_val.get<int>();
-          out.ded_row_map[{ch, ly, bk, row}] = offset;
+          out.ded_row_map[{ch, pch, bk, row}] = offset;
           offset++;
         }
       }
@@ -100,7 +97,7 @@ bool HbmRepairTable::load_from_json(const std::string& path, HbmRepairTable& out
           be.col_start   = burst_val["col_start"].get<int>();
           be.length      = burst_val["length"].get<int>();
           be.target_slot = burst_val["target_slot"].get<int>();
-          out.burst_map[{ch, ly, bk, be.row, be.col_start}] = be;
+          out.burst_map[{ch, pch, bk, be.row, be.col_start}] = be;
         }
       }
     }
@@ -127,26 +124,26 @@ void HbmRepairTable::print_detail(std::ostream& os) const {
 
   // ── Table 1: Layer D bad banks ──────────────────────────────────
   os << "\n[Table 1] Layer D — Bad Banks (" << bad_bank_set.size() << " total)\n";
-  os << "  idx |  ch   ly   bk\n";
+  os << "  idx |  ch   pch   bk\n";
   os << "  ----+---------------\n";
   int i = 0;
-  for (auto& [ch, ly, bk] : bad_bank_set) {
+  for (auto& [ch, pch, bk] : bad_bank_set) {
     os << "  " << std::setw(3) << i++ << " | "
        << std::setw(3) << ch << "  "
-       << std::setw(3) << ly << "  "
+       << std::setw(3) << pch << "  "
        << std::setw(3) << bk << "\n";
   }
 
   // ── Table 2: Layer A SRAM ────────────────────────────────────────
   os << "\n[Table 2] Layer A — SRAM Map (" << sram_full_map.size() << " total)\n";
-  os << "  idx |  ch   ly   bk    row  slot\n";
+  os << "  idx |  ch   pch   bk    row  slot\n";
   os << "  ----+-----------------------------\n";
   i = 0;
   for (auto& [key, slot] : sram_full_map) {
-    auto& [ch, ly, bk, row] = key;
+    auto& [ch, pch, bk, row] = key;
     os << "  " << std::setw(3) << i++ << " | "
        << std::setw(3) << ch << "  "
-       << std::setw(3) << ly << "  "
+       << std::setw(3) << pch << "  "
        << std::setw(3) << bk << "  "
        << std::setw(6) << row << "  "
        << std::setw(3) << slot << "\n";
@@ -154,14 +151,14 @@ void HbmRepairTable::print_detail(std::ostream& os) const {
 
   // ── Table 3: Layer B DED rows ────────────────────────────────────
   os << "\n[Table 3] Layer B — DED Rows (" << ded_row_map.size() << " total)\n";
-  os << "  idx |  ch   ly   bk    row  spare_offset\n";
+  os << "  idx |  ch   pch   bk    row  spare_offset\n";
   os << "  ----+-------------------------------------\n";
   i = 0;
   for (auto& [key, offset] : ded_row_map) {
-    auto& [ch, ly, bk, row] = key;
+    auto& [ch, pch, bk, row] = key;
     os << "  " << std::setw(3) << i++ << " | "
        << std::setw(3) << ch << "  "
-       << std::setw(3) << ly << "  "
+       << std::setw(3) << pch << "  "
        << std::setw(3) << bk << "  "
        << std::setw(6) << row << "  "
        << std::setw(3) << offset << "\n";
@@ -169,14 +166,14 @@ void HbmRepairTable::print_detail(std::ostream& os) const {
 
   // ── Table 4: Layer C burst ───────────────────────────────────────
   os << "\n[Table 4] Layer C — Burst Segments (" << burst_map.size() << " total)\n";
-  os << "  idx |  ch   ly   bk    row  col_start  len  slot\n";
+  os << "  idx |  ch   pch   bk    row  col_start  len  slot\n";
   os << "  ----+--------------------------------------------\n";
   i = 0;
   for (auto& [key, be] : burst_map) {
-    auto& [ch, ly, bk, row, col] = key;
+    auto& [ch, pch, bk, row, col] = key;
     os << "  " << std::setw(3) << i++ << " | "
        << std::setw(3) << ch << "  "
-       << std::setw(3) << ly << "  "
+       << std::setw(3) << pch << "  "
        << std::setw(3) << bk << "  "
        << std::setw(6) << row << "  "
        << std::setw(6) << be.col_start << "  "

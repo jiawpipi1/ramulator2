@@ -16,12 +16,11 @@ namespace Ramulator {
 
 // ¢w¢w¢w Key types ¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w
 // (channel, layer, bank)
-using BankKey  = std::tuple<int,int,int>;
-// (channel, layer, bank, row)
-using RowKey   = std::tuple<int,int,int,int>;
-// (channel, layer, bank, row, col_start)
-using BurstKey = std::tuple<int,int,int,int,int>;
+using BankKey  = std::tuple<int,int,int>;     // (ch, pch, bk)
+using RowKey   = std::tuple<int,int,int,int>; // (ch, pch, bk, row)
+using BurstKey = std::tuple<int,int,int,int,int>; // (ch, pch, bk, row, col_start)
 
+inline int ly_to_pch(int ly) { return ly & 1; }
 // ¢w¢w¢w Per-entry structures ¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w¢w
 struct BurstEntry {
   int row;
