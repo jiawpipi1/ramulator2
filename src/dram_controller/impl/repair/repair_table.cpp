@@ -1,19 +1,7 @@
 // repair_table.cpp
-// 從 ra_algorithm.cpp 吐出的 JSON 載入 4 張修復表並印出摘要確認。
+// Loads HBM repair tables from JSON (pch/bg/ba format).
 //
-// JSON 結構（你的 remap_hbm_1335.json）：
-// {
-//   "hbm_id": 1335,
-//   "K": 4,
-//   "layer_d_bad_banks": [[ch, ly, bk], ...],
-//   "layer_a_sram": [{"ch":…, "ly":…, "bk":…, "row":…, "sram_slot":…}, …],
-//   "banks": [
-//     { "ch":…, "ly":…, "bk":…,
-//       "layer_b_ded_rows": [row, …],
-//       "layer_c_burst": [{"row":…,"col_start":…,"length":…,"target_slot":…}, …]
-//     }, …
-//   ]
-// }
+// Compile & link with nlohmann/json (header-only).
 
 #include "dram_controller/impl/repair/repair_table.h"
 
@@ -21,7 +9,6 @@
 #include <iomanip>
 #include <stdexcept>
 
-// nlohmann/json 已在 ramulator2 extern/ 裡
 #include "nlohmann/json.hpp"
 
 using json = nlohmann::json;
@@ -45,51 +32,47 @@ bool HbmRepairTable::load_from_json(const std::string& path, HbmRepairTable& out
   }
 
   out.hbm_id = j.value("hbm_id", -1);
-  out.K      = j.value("K",      0);
+  out.K      = j.value("K",       0);
 
-  // ── Table 1: Layer D bad banks ─────────────────────────────────────────────
   if (j.contains("layer_d_bad_banks")) {
-    for (auto& entry : j["layer_d_bad_banks"]) {
-      int ch  = entry["ch"].get<int>();
-      int ly  = entry["ly"].get<int>();
-      int bk  = entry["bk"].get<int>();
-      int pch = ly_to_pch(ly);          // ← ly 轉 pch
-      out.bad_bank_set.insert({ch, pch, bk});
+    for (auto& e : j["layer_d_bad_banks"]) {
+      int ch  = e["ch"].get<int>();
+      int pch = e["pch"].get<int>();
+      int bg  = e["bg"].get<int>();
+      int ba  = e["ba"].get<int>();
+      out.bad_bank_set.insert({ch, pch, bg, ba});
     }
   }
 
-  // ── Table 2: Layer A SRAM full-row map ────────────────────────────────────
   if (j.contains("layer_a_sram")) {
-    for (auto& entry : j["layer_a_sram"]) {
-      int ch   = entry["ch"].get<int>();
-      int ly   = entry["ly"].get<int>();
-      int bk   = entry["bk"].get<int>();
-      int row  = entry["row"].get<int>();
-      int slot = entry["sram_slot"].get<int>();
-      int pch  = ly_to_pch(ly);          // ← ly 轉 pch
-      out.sram_full_map[{ch, pch, bk, row}] = slot;
+    for (auto& e : j["layer_a_sram"]) {
+      int ch   = e["ch"].get<int>();
+      int pch  = e["pch"].get<int>();
+      int bg   = e["bg"].get<int>();
+      int ba   = e["ba"].get<int>();
+      int row  = e["row"].get<int>();
+      int slot = e["sram_slot"].get<int>();
+      out.sram_full_map[{ch, pch, bg, ba, row}] = slot;
     }
   }
 
-  // ── Tables 3 & 4: per-bank Layer B + Layer C ──────────────────────────────
   if (j.contains("banks")) {
     for (auto& bank_entry : j["banks"]) {
       int ch  = bank_entry["ch"].get<int>();
-      int ly  = bank_entry["ly"].get<int>();
-      int bk  = bank_entry["bk"].get<int>();
-      int pch = ly_to_pch(ly);           // ← ly 轉 pch
+      int pch = bank_entry["pch"].get<int>();
+      int bg  = bank_entry["bg"].get<int>();
+      int ba  = bank_entry["ba"].get<int>();
 
-      // Table 3: Layer B — DED rows
+      
       if (bank_entry.contains("layer_b_ded_rows")) {
         int offset = 0;
         for (auto& row_val : bank_entry["layer_b_ded_rows"]) {
           int row = row_val.get<int>();
-          out.ded_row_map[{ch, pch, bk, row}] = offset;
-          offset++;
+          out.ded_row_map[{ch, pch, bg, ba, row}] = offset++;
         }
       }
 
-      // Table 4: Layer C — Burst col-range remap
+      
       if (bank_entry.contains("layer_c_burst")) {
         for (auto& burst_val : bank_entry["layer_c_burst"]) {
           BurstEntry be;
@@ -97,7 +80,7 @@ bool HbmRepairTable::load_from_json(const std::string& path, HbmRepairTable& out
           be.col_start   = burst_val["col_start"].get<int>();
           be.length      = burst_val["length"].get<int>();
           be.target_slot = burst_val["target_slot"].get<int>();
-          out.burst_map[{ch, pch, bk, be.row, be.col_start}] = be;
+          out.burst_map[{ch, pch, bg, ba, be.row, be.col_start}] = be;
         }
       }
     }
@@ -107,77 +90,77 @@ bool HbmRepairTable::load_from_json(const std::string& path, HbmRepairTable& out
 }
 
 void HbmRepairTable::print_summary(std::ostream& os) const {
-  os << "========================================\n";
-  os << "[RepairTable] LOAD SUMMARY\n";
-  os << "  hbm_id           = " << hbm_id << "\n";
-  os << "  K (vacuum rows)  = " << K      << "\n";
-  os << "----------------------------------------\n";
-  os << "  Table 1 | Layer D bad banks  : " << bad_bank_set.size()  << " banks\n";
-  os << "  Table 2 | Layer A SRAM rows  : " << sram_full_map.size() << " rows\n";
-  os << "  Table 3 | Layer B DED rows   : " << ded_row_map.size()   << " rows\n";
-  os << "  Table 4 | Layer C burst segs : " << burst_map.size()     << " segments\n";
-  os << "========================================\n";
+  os << "========================================\n"
+     << "[RepairTable] LOAD SUMMARY\n"
+     << "  hbm_id           = " << hbm_id << "\n"
+     << "  K (vacuum rows)  = " << K      << "\n"
+     << "----------------------------------------\n"
+     << "  Table 1 | Layer D bad banks  : " << bad_bank_set.size()  << " banks\n"
+     << "  Table 2 | Layer A SRAM rows  : " << sram_full_map.size() << " rows\n"
+     << "  Table 3 | Layer B DED rows   : " << ded_row_map.size()   << " rows\n"
+     << "  Table 4 | Layer C burst segs : " << burst_map.size()     << " segments\n"
+     << "========================================\n";
 }
 
 void HbmRepairTable::print_detail(std::ostream& os) const {
-  print_summary(os);  // 先印摘要
+  print_summary(os);
 
-  // ── Table 1: Layer D bad banks ──────────────────────────────────
-  os << "\n[Table 1] Layer D — Bad Banks (" << bad_bank_set.size() << " total)\n";
-  os << "  idx |  ch   pch   bk\n";
-  os << "  ----+---------------\n";
+  os << "\n[Table 1] Layer D ??? Bad Banks (" << bad_bank_set.size() << " total)\n";
+  os << "  idx |  ch  pch   bg   ba\n";
+  os << "  ----+--------------------\n";
   int i = 0;
-  for (auto& [ch, pch, bk] : bad_bank_set) {
+  for (auto& [ch, pch, bg, ba] : bad_bank_set) {
     os << "  " << std::setw(3) << i++ << " | "
-       << std::setw(3) << ch << "  "
+       << std::setw(3) << ch  << "  "
        << std::setw(3) << pch << "  "
-       << std::setw(3) << bk << "\n";
+       << std::setw(3) << bg  << "  "
+       << std::setw(3) << ba  << "\n";
   }
 
-  // ── Table 2: Layer A SRAM ────────────────────────────────────────
-  os << "\n[Table 2] Layer A — SRAM Map (" << sram_full_map.size() << " total)\n";
-  os << "  idx |  ch   pch   bk    row  slot\n";
-  os << "  ----+-----------------------------\n";
+  os << "\n[Table 2] Layer A ??? SRAM Map (" << sram_full_map.size() << " total)\n";
+  os << "  idx |  ch  pch   bg   ba    row  slot\n";
+  os << "  ----+---------------------------------\n";
   i = 0;
   for (auto& [key, slot] : sram_full_map) {
-    auto& [ch, pch, bk, row] = key;
+    auto& [ch, pch, bg, ba, row] = key;
     os << "  " << std::setw(3) << i++ << " | "
-       << std::setw(3) << ch << "  "
+       << std::setw(3) << ch  << "  "
        << std::setw(3) << pch << "  "
-       << std::setw(3) << bk << "  "
+       << std::setw(3) << bg  << "  "
+       << std::setw(3) << ba  << "  "
        << std::setw(6) << row << "  "
        << std::setw(3) << slot << "\n";
   }
 
-  // ── Table 3: Layer B DED rows ────────────────────────────────────
-  os << "\n[Table 3] Layer B — DED Rows (" << ded_row_map.size() << " total)\n";
-  os << "  idx |  ch   pch   bk    row  spare_offset\n";
-  os << "  ----+-------------------------------------\n";
+  os << "\n[Table 3] Layer B ??? DED Rows (" << ded_row_map.size() << " total)\n";
+  os << "  idx |  ch  pch   bg   ba    row  spare_offset\n";
+  os << "  ----+------------------------------------------\n";
   i = 0;
   for (auto& [key, offset] : ded_row_map) {
-    auto& [ch, pch, bk, row] = key;
+    auto& [ch, pch, bg, ba, row] = key;
     os << "  " << std::setw(3) << i++ << " | "
-       << std::setw(3) << ch << "  "
+       << std::setw(3) << ch  << "  "
        << std::setw(3) << pch << "  "
-       << std::setw(3) << bk << "  "
+       << std::setw(3) << bg  << "  "
+       << std::setw(3) << ba  << "  "
        << std::setw(6) << row << "  "
        << std::setw(3) << offset << "\n";
   }
 
-  // ── Table 4: Layer C burst ───────────────────────────────────────
-  os << "\n[Table 4] Layer C — Burst Segments (" << burst_map.size() << " total)\n";
-  os << "  idx |  ch   pch   bk    row  col_start  len  slot\n";
-  os << "  ----+--------------------------------------------\n";
+  os << "\n[Table 4] Layer C ??? Burst Segments (" << burst_map.size() << " total)\n";
+  os << "  idx |  ch  pch   bg   ba    row  col_start  len  slot\n";
+  os << "  ----+--------------------------------------------------\n";
   i = 0;
   for (auto& [key, be] : burst_map) {
-    auto& [ch, pch, bk, row, col] = key;
+    auto& [ch, pch, bg, ba, row, col] = key;
     os << "  " << std::setw(3) << i++ << " | "
-       << std::setw(3) << ch << "  "
+       << std::setw(3) << ch  << "  "
        << std::setw(3) << pch << "  "
-       << std::setw(3) << bk << "  "
+       << std::setw(3) << bg  << "  "
+       << std::setw(3) << ba  << "  "
        << std::setw(6) << row << "  "
        << std::setw(6) << be.col_start << "  "
-       << std::setw(3) << be.length << "  "
+       << std::setw(3) << be.length    << "  "
        << std::setw(4) << be.target_slot << "\n";
   }
   os << "========================================\n";

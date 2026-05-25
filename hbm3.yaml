@@ -1,7 +1,7 @@
 Frontend:
   impl: LoadStoreTrace
   clock_ratio: 4
-  path: hbm_test.trace
+  path: hbm3_test.trace
 
   Translation:
     impl: RandomTranslation
