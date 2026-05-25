@@ -9,6 +9,7 @@
 #include "frontend/frontend.h"
 #include "memory_system/memory_system.h"
 #include "dram_controller/impl/repair/repair_table.h" 
+#include "dram_controller/impl/repair/repair_debug.h"
 #include "example/example_ifce.h"
 
 int main(int argc, char* argv[]) {
@@ -23,6 +24,10 @@ int main(int argc, char* argv[]) {
     .help("Specify parameter to override in the configuration file. Repeat this option to change multiple parameters.");
   program.add_argument("--debug-repair")
     .help("Print detailed repair table contents after loading.")
+    .default_value(false)
+    .implicit_value(true);
+  program.add_argument("--debug-address")
+    .help("Print address decomposition and repair table lookup trace for every request.")
     .default_value(false)
     .implicit_value(true);
 
@@ -82,6 +87,10 @@ int main(int argc, char* argv[]) {
   } else if (use_yaml_file) {
     config = Ramulator::Config::parse_config_file(config_file_path, params);
   }
+
+  Ramulator::g_debug_address.store(
+    program.get<bool>("--debug-address"),
+    std::memory_order_relaxed);
   //Repair table load check 
   Ramulator::HbmRepairTable repair_tbl;
   std::string repair_path = "";

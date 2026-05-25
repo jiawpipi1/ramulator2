@@ -138,7 +138,12 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       // [ADD] Repair translation：只改 addr_vec，timing 完全不動
       // Layer A 也一樣：addr_vec 換到 SRAM 對應位置，走正常 DRAM pipeline
       if (m_repair_translator) {
-          RepairType rtype = m_repair_translator->translate(req.addr_vec);
+          Addr_t raw = req.addr;
+          if (g_debug_address.load(std::memory_order_relaxed)) {
+              std::cerr << "[ADDR-DBG-PRE] req.addr = " << raw
+                      << " (0x" << std::hex << raw << std::dec << ")\n";
+          }
+          RepairType rtype = m_repair_translator->translate(req.addr_vec, raw);
           switch (rtype) {
               case RepairType::NONE:    s_repair_none++;    break;
               case RepairType::LAYER_A: s_repair_layer_a++; break;  // addr已換，繼續走
