@@ -14,7 +14,7 @@ MemorySystem:
   DRAM:
     impl: HBM3
     org:
-      preset: HBM3_8Gb       # 定義在 HBM3.cpp: {8<<10, 128, {1,2,4,4,1<<15,1<<6}}
+      preset: HBM3_4Gb       # 定義在 HBM3.cpp: {8<<10, 128, {1,2,4,4,1<<15,1<<6}}
       channel: 16
       pseudochannel: 2
     timing:
