@@ -244,6 +244,23 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         if (req_it->is_stat_updated == false) {
           update_request_stats(req_it);
         }
+        if (g_debug_address.load(std::memory_order_relaxed)) {
+            const auto& av = req_it->addr_vec;
+            static const char* cmd_names[] = {
+                "ACT","PRE","PREA","RD","WR","RDA","WRA",
+                "REFab","REFsb","RFMab","RFMsb","?"
+            };
+            int cmd_id = req_it->command;
+            const char* cmd_str = (cmd_id >= 0 && cmd_id <= 10) ? cmd_names[cmd_id] : "?";
+            std::cerr << "[DRAM-ISSUE] cmd=" << cmd_str
+                      << " ch="  << (av.size()>0 ? av[0] : -1)
+                      << " pch=" << (av.size()>1 ? av[1] : -1)
+                      << " bg="  << (av.size()>2 ? av[2] : -1)
+                      << " ba="  << (av.size()>3 ? av[3] : -1)
+                      << " row=" << (av.size()>4 ? av[4] : -1)
+                      << " col=" << (av.size()>5 ? av[5] : -1)
+                      << "\n";
+        }
         m_dram->issue_command(req_it->command, req_it->addr_vec);
 
         // If we are issuing the last command, set depart clock cycle and move the request to the pending queue
@@ -451,6 +468,13 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       s_priority_queue_len_avg = (float) s_priority_queue_len / (float) m_clk;
 
       return;
+    }
+
+    bool is_empty() override {
+      return m_read_buffer.size() == 0 &&
+            m_write_buffer.size() == 0 &&
+            m_priority_buffer.size() == 0 &&
+            pending.size() == 0;
     }
 
 };

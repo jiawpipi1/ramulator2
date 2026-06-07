@@ -1,15 +1,19 @@
 Frontend:
-  impl: LoadStoreTrace
+  impl: SimpleO3
   clock_ratio: 4
-  path: hbm3_test.trace
+  num_expected_insts: 10000000
+  traces: 
+    - stream_10M.trace
 
   Translation:
     impl: RandomTranslation
-    max_addr: 2147483648   # 先保持原本 2GB，等 repair 整合後再調
+    max_addr: 8589934592   
 
 MemorySystem:
   impl: GenericDRAM
   clock_ratio: 2
+  output_dir: ./results          # ← 加這行
+  output_file: stream_10M_d16
 
   DRAM:
     impl: HBM3

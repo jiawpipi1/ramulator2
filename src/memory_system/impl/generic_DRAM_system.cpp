@@ -47,6 +47,7 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override { }
 
+
     bool send(Request req) override {
       m_addr_mapper->apply(req);
       int channel_id = req.addr_vec[0];
@@ -71,6 +72,13 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
 
       return is_success;
     };
+
+    bool is_empty() override {
+      for (auto& ctrl : m_controllers) {
+        if (!ctrl->is_empty()) return false;
+      }
+      return true;
+    }
     
     void tick() override {
       m_clk++;

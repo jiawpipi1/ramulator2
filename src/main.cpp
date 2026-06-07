@@ -138,16 +138,17 @@ int main(int argc, char* argv[]) {
     if (((i % tick_mult) % mem_tick) == 0) {
       frontend->tick();
     }
-
-    if (frontend->is_finished()) {
-      break;
-    }
-
     if ((i % tick_mult) % frontend_tick == 0) {
       memory_system->tick();
     }
+    if (frontend->is_finished()) {
+      break;
+    }
   }
 
+  while (!memory_system->is_empty()) {
+    memory_system->tick();
+  }
   // Finalize the simulation. Recursively print all statistics from all components
   frontend->finalize();
   memory_system->finalize();

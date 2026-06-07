@@ -49,6 +49,8 @@ class IDRAMController : public Clocked<IDRAMController> {
      * 
      */
     virtual void tick() = 0;
+
+    virtual bool is_empty()  { return true; }
    
 };
 

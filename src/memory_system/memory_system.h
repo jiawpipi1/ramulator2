@@ -19,6 +19,7 @@ class IMemorySystem : public TopLevel<IMemorySystem> {
   protected:
     IFrontEnd* m_frontend;
     uint m_clock_ratio = 1;
+    
 
   public:
     virtual void connect_frontend(IFrontEnd* frontend) { 
@@ -28,6 +29,7 @@ class IMemorySystem : public TopLevel<IMemorySystem> {
         component->setup(frontend, this);
       }
     };
+
 
     virtual void finalize() { 
       for (auto component : m_components) {
@@ -49,6 +51,8 @@ class IMemorySystem : public TopLevel<IMemorySystem> {
      * @return   false    Request is rejected by the memory system, maybe the memory controller is full?
      */
     virtual bool send(Request req) = 0;
+
+    virtual bool is_empty() { return true; }
 
     /**
      * @brief         Ticks the memory system
