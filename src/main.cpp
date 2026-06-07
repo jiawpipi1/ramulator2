@@ -145,10 +145,12 @@ int main(int argc, char* argv[]) {
       break;
     }
   }
-
+  uint64_t drain_cycles = 0;
   while (!memory_system->is_empty()) {
     memory_system->tick();
+    drain_cycles++;
   }
+  std::cerr << "[DRAIN] extra " << drain_cycles << " cycles\n";
   // Finalize the simulation. Recursively print all statistics from all components
   frontend->finalize();
   memory_system->finalize();
