@@ -154,6 +154,31 @@ int main() {
               "D target row in vacuum band (row="+std::to_string(r)+")");
     }
 
+    std::cout << "== Bloom pre-filter ==\n";
+    check(T.bloom_enabled() && T.bloom_num_bits() > 0, "bloom built (enabled, non-empty)");
+    // Bloom must NOT change any translation result: compare against a bloom-off twin.
+    RepairTranslator T_nb(t, /*enable_bloom=*/false);
+    bool equal_all = true;
+    auto same = [&](AddrVec_t v){
+        AddrVec_t a=v,b=v; RepairType ra=T.translate(a), rb=T_nb.translate(b);
+        if (ra!=rb || a!=b) equal_all=false;
+    };
+    // real A/B/C keys (must be looked up, i.e. bloom "maybe"), dead-bank rows, and clean rows
+    for (int col : {5,8,9,11,12,20,45}) {
+        same(A(1,0,0,3,512,col)); same(A(1,0,0,3,800,col)); same(A(1,0,0,3,900,col));
+        same(A(3,0,0,1,60,col));  same(A(3,0,0,2,70,col));
+        same(A(0,0,0,0,col*37,col)); same(A(0,0,0,1,col*11,col));
+    }
+    for (int r=0; r<4000; r+=7) { same(A(5,0,0,0,r,3)); same(A(2,0,0,1,r,9)); }
+    check(equal_all, "bloom on == bloom off for all sampled addresses");
+    // Real A/B/C keys must never be screened out (no false negatives).
+    { AddrVec_t v=A(1,0,0,3,512,5); T.translate(v); check(!T.last_bloom_reject(), "A key -> bloom maybe (not screened)"); }
+    { AddrVec_t v=A(1,0,0,3,800,5); T.translate(v); check(!T.last_bloom_reject(), "B key -> bloom maybe"); }
+    { AddrVec_t v=A(1,0,0,3,900,8); T.translate(v); check(!T.last_bloom_reject(), "C key -> bloom maybe"); }
+    // Clean rows should mostly take the fast (reject) path -> that is the power win.
+    { size_t rej=0,tot=0; for (int r=0;r<2000;++r){ AddrVec_t v=A(6,0,0,2,r,1); T.translate(v); ++tot; if(T.last_bloom_reject())++rej; }
+      check(rej > tot*9/10, "clean addrs mostly bloom-rejected (fast path >90%)"); }
+
     std::cout << "\n================ RESULT ================\n";
     std::cout << "  passed: " << g_pass << "   failed: " << g_fail << "\n";
     std::cout << "========================================\n";

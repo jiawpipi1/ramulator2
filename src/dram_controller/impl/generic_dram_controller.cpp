@@ -1,3 +1,5 @@
+#include <list>
+#include <utility>
 #include "dram_controller/controller.h"
 #include "memory_system/memory_system.h"
 #include "dram_controller/impl/repair/repair_translator.h"
@@ -58,11 +60,16 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     size_t s_repair_layer_b = 0;
     size_t s_repair_layer_c = 0;
     size_t s_repair_layer_d = 0;
+    size_t s_bloom_reject   = 0;
+    size_t s_bloom_maybe    = 0;
+    int    m_repair_lookup_latency = 0;
+    std::list<std::pair<Clk_t, Request>> m_repair_pipeline;
     HbmRepairTable m_repair_table;  
 
 
   public:
     void init() override {
+      m_repair_lookup_latency = param<int>("repair_lookup_latency").default_val(0);
       m_wr_low_watermark =  param<float>("wr_low_watermark").desc("Threshold for switching back to read mode.").default_val(0.2f);
       m_wr_high_watermark = param<float>("wr_high_watermark").desc("Threshold for switching to write mode.").default_val(0.8f);
 
@@ -81,7 +88,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         if (!HbmRepairTable::load_from_json(*path, m_repair_table)) {  // ← 用 member
             spdlog::error("Failed to load repair table: {}", *path);
         } else {
-            m_repair_translator = std::make_unique<RepairTranslator>(m_repair_table);
+            bool enable_bloom = param<bool>("repair_enable_bloom").default_val(true);
+            m_repair_translator = std::make_unique<RepairTranslator>(m_repair_table, enable_bloom);
         }
       }
     };
@@ -112,6 +120,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       register_stat(s_repair_layer_b).name("repair_layer_b_{}", m_channel_id);
       register_stat(s_repair_layer_c).name("repair_layer_c_{}", m_channel_id);
       register_stat(s_repair_layer_d).name("repair_layer_d_{}", m_channel_id);
+      register_stat(s_bloom_reject).name("bloom_reject_{}", m_channel_id);
+      register_stat(s_bloom_maybe ).name("bloom_maybe_{}",  m_channel_id);
       for (size_t core_id = 0; core_id < m_num_cores; core_id++) {
         register_stat(s_read_row_hits_per_core[core_id]).name("read_row_hits_core_{}", core_id);
         register_stat(s_read_row_misses_per_core[core_id]).name("read_row_misses_core_{}", core_id);
@@ -151,6 +161,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
               case RepairType::LAYER_C: s_repair_layer_c++; break;
               case RepairType::LAYER_D: s_repair_layer_d++; break;
           }
+          if (m_repair_translator->last_bloom_reject()) s_bloom_reject++;
+          else                                          s_bloom_maybe++;
           // 所有 layer 都繼續往下走，不 return，不改 depart
       }
       // [ADD END]
@@ -169,6 +181,15 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           s_num_other_reqs++;
           break;
         }
+      }
+
+      // [ADD] repair lookup latency: hold the translated request until the
+      // lookup completes; req.arrive keeps the true arrival cycle so
+      // read_latency includes any lookup delay NOT hidden by queueing.
+      if (m_repair_translator && m_repair_lookup_latency > 0) {
+        req.arrive = m_clk;
+        m_repair_pipeline.push_back({m_clk + m_repair_lookup_latency, req});
+        return true;
       }
 
       // Forward existing write requests to incoming read requests
@@ -213,6 +234,16 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
     void tick() override {
       m_clk++;
+
+      // drain repair-lookup pipeline: enqueue requests whose lookup completed
+      for (auto _pit = m_repair_pipeline.begin(); _pit != m_repair_pipeline.end(); ) {
+        if (_pit->first <= m_clk) {
+          Request& _r = _pit->second;
+          bool _ok = (_r.type_id == Request::Type::Read)  ? m_read_buffer.enqueue(_r)
+                   : (_r.type_id == Request::Type::Write) ? m_write_buffer.enqueue(_r) : false;
+          if (_ok) _pit = m_repair_pipeline.erase(_pit); else ++_pit;
+        } else { ++_pit; }
+      }
 
       // Update statistics
       s_queue_len += m_read_buffer.size() + m_write_buffer.size() + m_priority_buffer.size() + pending.size();

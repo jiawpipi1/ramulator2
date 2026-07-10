@@ -33,6 +33,7 @@
 
 #include <iomanip>
 #include <iostream>
+#include <cstdint>
 #include <map>
 #include <tuple>
 #include <vector>
@@ -42,6 +43,59 @@
 #include "base/base.h"   // AddrVec_t, Addr_t
 
 namespace Ramulator {
+
+// -- Bloom filter --------------------------------------------------------
+// Screens the fine-grained (bank,row) A/B/C repair keys. Remapping is sparse
+// (almost every request is a pass-through), so a request whose (bank,row) is
+// "definitely not" in the repair set can skip all the A/B/C table lookups --
+// saving lookup energy. No false negatives: a real A/B/C key always tests
+// "maybe present", so translation stays exact. False positives just fall back
+// to the full (correct) lookup.
+class BloomFilter {
+public:
+    void build(size_t n_keys, int bits_per_key, int k) {
+        m_k = (k > 0) ? k : 1;
+        size_t nbits = (n_keys ? n_keys : 1) * (size_t)(bits_per_key > 0 ? bits_per_key : 12);
+        if (nbits < 1024) nbits = 1024;
+        m_nbits = nbits;
+        m_bits.assign(m_nbits, false);
+    }
+    bool built() const { return m_nbits > 0; }
+    void insert(uint64_t key) {
+        uint64_t h1, h2; hashes(key, h1, h2);
+        for (int i = 0; i < m_k; ++i) m_bits[(h1 + (uint64_t)i * h2) % m_nbits] = true;
+    }
+    // true  => key MIGHT be present (do the full lookup)
+    // false => key is DEFINITELY absent (safe to skip A/B/C)
+    bool maybe_contains(uint64_t key) const {
+        if (!built()) return true;               // disabled -> never screens
+        uint64_t h1, h2; hashes(key, h1, h2);
+        for (int i = 0; i < m_k; ++i)
+            if (!m_bits[(h1 + (uint64_t)i * h2) % m_nbits]) return false;
+        return true;
+    }
+    size_t num_bits() const { return m_nbits; }
+    int    num_hashes() const { return m_k; }
+private:
+    static uint64_t mix(uint64_t x) {
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+        x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33; return x;
+    }
+    void hashes(uint64_t key, uint64_t& h1, uint64_t& h2) const {
+        h1 = mix(key);
+        h2 = mix(key ^ 0x9e3779b97f4a7c15ULL) | 1ULL;   // odd, so coprime with m
+    }
+    std::vector<bool> m_bits;
+    size_t m_nbits = 0;
+    int    m_k = 0;
+};
+
+// Pack (ch,pch,bg,ba,row) into one 64-bit Bloom key.
+inline uint64_t bank_row_key(int ch, int pch, int bg, int ba, int row) {
+    return ((uint64_t)(uint32_t)ch  << 44) | ((uint64_t)(uint32_t)pch << 42)
+         | ((uint64_t)(uint32_t)bg  << 38) | ((uint64_t)(uint32_t)ba  << 32)
+         | (uint64_t)(uint32_t)row;
+}
 
 // HBM3 addr_vec index  (ChRaBaRoCo mapper output)
 static constexpr int AIDX_CH  = 0;
@@ -66,8 +120,11 @@ inline const char* repair_type_name(RepairType t) {
 
 class RepairTranslator {
 public:
-    explicit RepairTranslator(const HbmRepairTable& tbl) : m_tbl(tbl) {
+    explicit RepairTranslator(const HbmRepairTable& tbl, bool enable_bloom = true,
+                              int bloom_bits_per_key = 12, int bloom_k = 8)
+        : m_tbl(tbl), m_bloom_enabled(enable_bloom) {
         build_bank_lists();
+        if (m_bloom_enabled) build_bloom(bloom_bits_per_key, bloom_k);
     }
 
     // Number of live/dead banks and the band height (exposed for tests/introspection).
@@ -76,6 +133,14 @@ public:
     int band_h()    const { return m_band_h; }
     // Rows reserved per live bank as the Layer D vacuum region.
     int vacuum_rows_per_bank() const { return m_num_dead * m_band_h; }
+
+    // Bloom introspection / stats (cumulative across translate() calls).
+    bool   bloom_enabled()   const { return m_bloom_enabled; }
+    size_t bloom_num_bits()  const { return m_bloom.num_bits(); }
+    int    bloom_num_hashes()const { return m_bloom.num_hashes(); }
+    size_t bloom_rejects()   const { return m_bloom_reject; }   // fast path taken
+    size_t bloom_maybes()    const { return m_bloom_maybe;  }   // full A/B/C lookup done
+    bool   last_bloom_reject() const { return m_last_reject; }  // for the most recent translate()
 
     RepairType translate(AddrVec_t& av, Addr_t raw_addr = 0) const {
         int ch  = av[AIDX_CH];
@@ -130,6 +195,19 @@ public:
                     << "(ord_found=" << (it != m_dead_ordinal.end())
                     << " L=" << m_num_live << " j=" << j << ") -> pass-through\n";
             }
+        }
+
+        // -- Bloom pre-filter: skip A/B/C when (bank,row) is definitely absent -
+        m_last_reject = false;
+        if (m_bloom_enabled) {
+            if (!m_bloom.maybe_contains(bank_row_key(ch, pch, bg, ba, row))) {
+                ++m_bloom_reject;
+                m_last_reject = true;
+                if (dbg) std::cerr << "  [Bloom] reject -> skip A/B/C  RESULT: "
+                                   << repair_type_name(d_result) << "\n";
+                return d_result;                 // LAYER_D if relocated, else NONE
+            }
+            ++m_bloom_maybe;                      // fall through to full lookup
         }
 
         // -- Layer A: SRAM overflow row ---------------------------------------
@@ -213,10 +291,36 @@ private:
         m_band_h   = (m_num_live > 0) ? (m_R + m_num_live - 1) / m_num_live : 0;
     }
 
+    // Insert every fine-grained A/B/C (bank,row) repair key. Layer D is NOT
+    // inserted -- it is a coarse per-bank check against bad_bank_set.
+    void build_bloom(int bits_per_key, int k) {
+        size_t n = m_tbl.sram_full_map.size() + m_tbl.ded_row_map.size()
+                 + m_tbl.burst_map.size();
+        m_bloom.build(n, bits_per_key, k);
+        for (auto& [key, v] : m_tbl.sram_full_map) {
+            auto& [ch, pch, bg, ba, row] = key;
+            m_bloom.insert(bank_row_key(ch, pch, bg, ba, row));
+        }
+        for (auto& [key, v] : m_tbl.ded_row_map) {
+            auto& [ch, pch, bg, ba, row] = key;
+            m_bloom.insert(bank_row_key(ch, pch, bg, ba, row));
+        }
+        for (auto& [key, be] : m_tbl.burst_map) {
+            auto& [ch, pch, bg, ba, row, cs] = key;
+            m_bloom.insert(bank_row_key(ch, pch, bg, ba, row));
+        }
+    }
+
     const HbmRepairTable&  m_tbl;
     std::vector<BankKey4>  m_live_banks;
     std::map<BankKey4,int> m_dead_ordinal;
     int m_R = 0, m_num_live = 0, m_num_dead = 0, m_band_h = 0;
+
+    bool           m_bloom_enabled = false;
+    BloomFilter    m_bloom;
+    mutable size_t m_bloom_reject = 0;
+    mutable size_t m_bloom_maybe  = 0;
+    mutable bool   m_last_reject  = false;
 };
 
 } // namespace Ramulator
