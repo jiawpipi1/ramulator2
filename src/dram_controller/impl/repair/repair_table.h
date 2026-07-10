@@ -44,6 +44,17 @@ struct RepairConfig {
   int sram_slots       = 16;
   int rows_per_bank    = 16384;
 
+  // Bank geometry (needed by Layer D to enumerate live banks).
+  // A die's banks are (ch, pch, bg, ba); ly = bg*num_pch + pch matches the
+  // offline tool's ordering. Defaults are HBM3 (16 ch x 2 pch x 4 bg x 4 ba = 512).
+  int num_channels = 16;
+  int num_pch      = 2;
+  int num_bg       = 4;
+  int num_ba       = 4;
+
+  int banks_per_channel() const { return num_pch * num_bg * num_ba; }
+  int total_banks()       const { return num_channels * banks_per_channel(); }
+
   // Physical row addresses for spare rows (appended above normal rows)
   int ded_spare_base()   const { return rows_per_bank; }             // 16384
   int burst_spare_base() const { return rows_per_bank + ded_count; } // 16386

@@ -34,6 +34,24 @@ bool HbmRepairTable::load_from_json(const std::string& path, HbmRepairTable& out
   out.hbm_id = j.value("hbm_id", -1);
   out.K      = j.value("K",       0);
 
+  // Optional "config" block. When present it makes the table self-describing
+  // (spare-row base addresses and Layer D geometry no longer depend on the
+  // compiled-in defaults matching the repairv2 run). Absent -> keep defaults.
+  if (j.contains("config")) {
+    const auto& c = j["config"];
+    RepairConfig& cfg = out.cfg;
+    cfg.total_spare_rows = c.value("total_spare_rows", cfg.total_spare_rows);
+    cfg.bursts_per_row   = c.value("bursts_per_row",   cfg.bursts_per_row);
+    cfg.sram_slots       = c.value("sram_slots",       cfg.sram_slots);
+    cfg.rows_per_bank    = c.value("rows_per_bank",    cfg.rows_per_bank);
+    cfg.num_channels     = c.value("num_channels",     cfg.num_channels);
+    cfg.num_pch          = c.value("num_pch",          cfg.num_pch);
+    cfg.num_bg           = c.value("num_bg",           cfg.num_bg);
+    cfg.num_ba           = c.value("num_ba",           cfg.num_ba);
+    cfg.ded_count        = cfg.total_spare_rows / 2;
+    cfg.frag_count       = cfg.total_spare_rows - cfg.ded_count;
+  }
+
   if (j.contains("layer_d_bad_banks")) {
     for (auto& e : j["layer_d_bad_banks"]) {
       int ch  = e["ch"].get<int>();
