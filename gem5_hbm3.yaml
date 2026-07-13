@@ -1,0 +1,53 @@
+# Ramulator2 config for use as a gem5 memory (src/mem/ramulator2.cc).
+#
+# The ONLY difference from hbm3.yaml is the frontend: gem5 drives the requests,
+# so we select the GEM5 frontend (which just forwards
+# receive_external_requests() into the memory system) instead of a trace reader.
+#
+# Set the repair table from the gem5 config with:
+#   Ramulator2(configFile=..., ...)  and edit repair_table_path below, or
+#   generate a per-run copy of this file.
+
+Frontend:
+  impl: GEM5
+  clock_ratio: 1          # unused for GEM5 (gem5 owns the clock), kept for the API
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+  output_dir: ./results
+  output_file: gem5_hbm3
+
+  DRAM:
+    impl: HBM3
+    org:
+      preset: HBM3_4Gb     # 16384 rows, 64 columns
+      channel: 16
+      pseudochannel: 2
+      channel_width: 128   # prefetch(2) x 128/8 = 32 B transaction
+                           # -> 32 addressable column slots x 32 B = 1 KB page (JEDEC)
+    timing:
+      preset: HBM3_2Gbps
+
+  Controller:
+    impl: Generic
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: AllBank        # realistic: refresh ON (NoRefresh is only for smoke tests)
+    RowPolicy:
+      impl: OpenRowPolicy
+    # Per-die repair table produced by repairv2 --dump-json.
+    # Comment out for the fault-free baseline.
+    repair_table_path: ../Fault_yield/remap_json_hbm3/remap_hbm_0.json
+    plugins:
+
+  AddrMapper:
+    impl: LineRoBaRaCoCh   # channel interleaved at CACHE-LINE granularity:
+    line_size: 64          #   [row|ba|ra|col_hi|ch|col_lo|32B]
+                           # - both 32 B halves of a 64 B line stay in ONE
+                           #   channel/bank/row (2nd half = row-buffer hit)
+                           # - consecutive lines rotate across all 16 channels
+                           # Plain RoBaRaCoCh splits every line across two
+                           # channels; ChRaBaRoCo (channel in the TOP bits)
+                           # would put ALL gem5 SE traffic on channel 0.

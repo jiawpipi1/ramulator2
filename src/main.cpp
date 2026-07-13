@@ -104,9 +104,9 @@ int main(int argc, char* argv[]) {
   if (!repair_path.empty()) {
     if (Ramulator::HbmRepairTable::load_from_json(repair_path, repair_tbl)) {
       if (debug_repair) {
-        repair_tbl.print_detail();   // ¸Ô²Óª©
+        repair_tbl.print_detail();   // è©³ç´°ç‰ˆ
       } else {
-        repair_tbl.print_summary();  // ¥u¦LºK­n
+        repair_tbl.print_summary();  // åªå°æ‘˜è¦
       }
     } else {
       spdlog::error("Failed to load repair table from: {}", repair_path);

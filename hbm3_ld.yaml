@@ -1,0 +1,36 @@
+Frontend:
+  impl: LoadStoreTrace
+  clock_ratio: 4
+  path: hbm3_test.trace
+
+  Translation:
+    impl: RandomTranslation
+    max_addr: 8589934592   
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 2
+  output_dir: ./results          # ← 加這行
+  output_file: stream_10M_d16
+
+  DRAM:
+    impl: HBM3
+    org:
+      preset: HBM3_4Gb       # 定義在 HBM3.cpp: {8<<10, 128, {1,2,4,4,1<<15,1<<6}}
+      channel: 16
+      pseudochannel: 2
+    timing:
+      preset: HBM3_2Gbps     # HBM3.cpp 裡唯一有的 timing preset
+
+  Controller:
+    impl: Generic
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: NoRefresh
+    RowPolicy:
+      impl: OpenRowPolicy
+    plugins:
+
+  AddrMapper:
+    impl: ChRaBaRoCo

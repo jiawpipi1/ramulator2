@@ -54,7 +54,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     float s_avg_read_latency = 0;
     // [ADD] Repair stats
     std::unique_ptr<RepairTranslator> m_repair_translator;
-    int m_sram_read_latency = 6;  // «O¯d¦ı¤£¥Î©ó timing¡A¥u¨Ñ²Î­p°Ñ¦Ò
+    int m_sram_read_latency = 6;  // ä¿ç•™ä½†ä¸ç”¨æ–¼ timingï¼Œåªä¾›çµ±è¨ˆåƒè€ƒ
     size_t s_repair_none    = 0;
     size_t s_repair_layer_a = 0;
     size_t s_repair_layer_b = 0;
@@ -85,7 +85,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       }
       // add
       if (auto path = param<std::string>("repair_table_path").optional()) {
-        if (!HbmRepairTable::load_from_json(*path, m_repair_table)) {  // ¡ö ¥Î member
+        if (!HbmRepairTable::load_from_json(*path, m_repair_table)) {  // â† ç”¨ member
             spdlog::error("Failed to load repair table: {}", *path);
         } else {
             bool enable_bloom = param<bool>("repair_enable_bloom").default_val(true);
@@ -148,8 +148,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     };
 
     bool send(Request& req) override {
-      // [ADD] Repair translation¡G¥u§ï addr_vec¡Atiming §¹¥ş¤£°Ê
-      // Layer A ¤]¤@¼Ë¡Gaddr_vec ´«¨ì SRAM ¹ïÀ³¦ì¸m¡A¨«¥¿±` DRAM pipeline
+      // [ADD] Repair translationï¼šåªæ”¹ addr_vecï¼Œtiming å®Œå…¨ä¸å‹•
+      // Layer A ä¹Ÿä¸€æ¨£ï¼šaddr_vec æ›åˆ° SRAM å°æ‡‰ä½ç½®ï¼Œèµ°æ­£å¸¸ DRAM pipeline
       if (m_repair_translator) {
           Addr_t raw = req.addr;
           if (g_debug_address.load(std::memory_order_relaxed)) {
@@ -159,14 +159,14 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           RepairType rtype = m_repair_translator->translate(req.addr_vec, raw);
           switch (rtype) {
               case RepairType::NONE:    s_repair_none++;    break;
-              case RepairType::LAYER_A: s_repair_layer_a++; break;  // addr¤w´«¡AÄ~Äò¨«
+              case RepairType::LAYER_A: s_repair_layer_a++; break;  // addrå·²æ›ï¼Œç¹¼çºŒèµ°
               case RepairType::LAYER_B: s_repair_layer_b++; break;
               case RepairType::LAYER_C: s_repair_layer_c++; break;
               case RepairType::LAYER_D: s_repair_layer_d++; break;
           }
           if (m_repair_translator->last_bloom_reject()) s_bloom_reject++;
           else                                          s_bloom_maybe++;
-          // ©Ò¦³ layer ³£Ä~Äò©¹¤U¨«¡A¤£ return¡A¤£§ï depart
+          // æ‰€æœ‰ layer éƒ½ç¹¼çºŒå¾€ä¸‹èµ°ï¼Œä¸ returnï¼Œä¸æ”¹ depart
       }
       // [ADD END]
       req.final_command = m_dram->m_request_translations(req.type_id);
