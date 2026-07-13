@@ -89,6 +89,9 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
             spdlog::error("Failed to load repair table: {}", *path);
         } else {
             bool enable_bloom = param<bool>("repair_enable_bloom").default_val(true);
+        if (param<bool>("repair_debug_addr").default_val(false)) {
+          g_debug_address.store(true, std::memory_order_relaxed);
+        }
             m_repair_translator = std::make_unique<RepairTranslator>(m_repair_table, enable_bloom);
         }
       }
