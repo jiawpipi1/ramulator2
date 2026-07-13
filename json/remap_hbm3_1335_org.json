@@ -1,6 +1,7 @@
 {
   "hbm_id": 1335,
   "K": 32,
+  "config": {"rows_per_bank":16384,"total_spare_rows":4,"sram_slots":16,"num_channels":16,"num_pch":2,"num_bg":4,"num_ba":4},
   "layer_d_bad_banks": [
     {"ch":12,"ly":2,"bk":2}
   ],
