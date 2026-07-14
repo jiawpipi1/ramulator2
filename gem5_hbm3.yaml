@@ -39,7 +39,10 @@ MemorySystem:
       impl: OpenRowPolicy
     # Per-die repair table produced by repairv2 --dump-json.
     # Comment out for the fault-free baseline.
-    repair_table_path: ../Fault_yield/remap_json_hbm3/remap_hbm_0.json
+    repair_table_path: json/remap_hbm3_smoke.json
+    repair_lookup_latency: 0   # translator/Bloom lookup cycles (set after RTL/CACTI)
+    layer_a_data_latency: 6    # logic-die SRAM data access; Layer A bypasses DRAM
+    repair_pipeline_size: 64   # bounded pre-controller lookup/SRAM pipeline
     plugins:
 
   AddrMapper:

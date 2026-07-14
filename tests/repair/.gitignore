@@ -1,3 +1,5 @@
 test_repair_translator
 test_json_roundtrip
+test_req_buffer
+validate_repair_directory
 _known_tmp.json

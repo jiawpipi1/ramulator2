@@ -56,7 +56,7 @@ static void expect_D(RepairTranslator& T, AddrVec_t av, AddrVec_t want_av, const
 int main() {
     HbmRepairTable t;
     t.hbm_id = 0;
-    t.K      = 32;
+    t.K      = 530;
 
     // Geometry: 8 ch x 1 pch x 1 bg x 8 ba = 64 banks. Enumeration order is
     // (ch, ly=0, ba) so global index = ch*8 + ba.
@@ -64,7 +64,8 @@ int main() {
     t.cfg.num_pch      = 1;
     t.cfg.num_bg       = 1;
     t.cfg.num_ba       = 8;
-    const RepairConfig& c = t.cfg;      // rpb=16384, tsr=4, ded=2, frag=2, bpr=64, sram=16
+    t.cfg.vacuum_limit = 1024;
+    const RepairConfig& c = t.cfg;      // rpb=16384, tsr=4, ded=2, frag=2, bpr=32, sram=16
     const int RPB = c.rows_per_bank;    // 16384
 
     // Layer D: dead banks (0,0,0,0)=ord0 and (0,0,0,1)=ord1.
@@ -92,8 +93,8 @@ int main() {
         t.burst_map[{ch,pch,bg,ba,row,cs}] = BurstEntry{row,cs,len,slot};
     };
     addC(1,0,0,3, 900, 8,4,0);
-    addC(1,0,0,3, 900,12,4,1);
-    addC(1,0,0,3, 900,20,2,5);
+    addC(1,0,0,3, 900,12,4,4);
+    addC(1,0,0,3, 900,20,2,8);
     addC(3,0,0,2, 70, 8,4,3);             // shadowed by B
     // fall-through target: dead1 row1 relocates to (0,0,0,2,15855)
     addC(0,0,0,2, 15855, 8,4,0);
@@ -115,7 +116,7 @@ int main() {
     expect_D(T, A(0,0,0,1, 3,   5), A(0,0,0,2, 15857, 5), "D dead1 row3 -> lower band");
     // fall-through: relocated top row is itself faulty -> A/B/C also applied, still reports LAYER_D
     expect_D(T, A(0,0,0,1, 0,   5), A(0,0,0,2, B_base+1, 5), "D->B fall-through (dead1 row0)");
-    expect_D(T, A(0,0,0,1, 1,   9), A(0,0,0,2, C_base,   0), "D->C fall-through (dead1 row1 col9)");
+    expect_D(T, A(0,0,0,1, 1,   9), A(0,0,0,2, C_base,   1), "D->C fall-through preserves range offset");
     expect_D(T, A(0,0,0,1, 2,   7), A(0,0,0,2, A_base+3, 7), "D->A fall-through (dead1 row2)");
 
     std::cout << "== Layer A / B / C on live banks ==\n";
@@ -124,11 +125,11 @@ int main() {
     expect(T, A(1,0,0,3, 800, 1), RepairType::LAYER_B, A(1,0,0,3, B_base+0, 1), "B offset0");
     expect(T, A(1,0,0,3, 801, 1), RepairType::LAYER_B, A(1,0,0,3, B_base+1, 1), "B offset1");
     expect(T, A(1,0,0,3, 900,  8), RepairType::LAYER_C, A(1,0,0,3, C_base, 0), "C slot0 start");
-    expect(T, A(1,0,0,3, 900, 11), RepairType::LAYER_C, A(1,0,0,3, C_base, 0), "C slot0 end-incl");
+    expect(T, A(1,0,0,3, 900, 11), RepairType::LAYER_C, A(1,0,0,3, C_base, 3), "C range offset preserved");
     expect(T, A(1,0,0,3, 900,  7), RepairType::NONE,    A(1,0,0,3, 900,   7), "C below range");
-    expect(T, A(1,0,0,3, 900, 12), RepairType::LAYER_C, A(1,0,0,3, C_base, 1), "C adjacent slot1");
+    expect(T, A(1,0,0,3, 900, 12), RepairType::LAYER_C, A(1,0,0,3, C_base, 4), "C adjacent range slot4");
     expect(T, A(1,0,0,3, 900, 16), RepairType::NONE,    A(1,0,0,3, 900,  16), "C gap -> NONE");
-    expect(T, A(1,0,0,3, 900, 20), RepairType::LAYER_C, A(1,0,0,3, C_base, 5), "C 3rd entry slot5");
+    expect(T, A(1,0,0,3, 900, 20), RepairType::LAYER_C, A(1,0,0,3, C_base, 8), "C 3rd entry slot8");
 
     std::cout << "== Layer priority on a live bank (A>B>C) ==\n";
     expect(T, A(3,0,0,1, 60, 4), RepairType::LAYER_A, A(3,0,0,1, A_base+2, 4), "A beats B");
@@ -164,7 +165,7 @@ int main() {
         if (ra!=rb || a!=b) equal_all=false;
     };
     // real A/B/C keys (must be looked up, i.e. bloom "maybe"), dead-bank rows, and clean rows
-    for (int col : {5,8,9,11,12,20,45}) {
+    for (int col : {5,8,9,11,12,20,31}) {
         same(A(1,0,0,3,512,col)); same(A(1,0,0,3,800,col)); same(A(1,0,0,3,900,col));
         same(A(3,0,0,1,60,col));  same(A(3,0,0,2,70,col));
         same(A(0,0,0,0,col*37,col)); same(A(0,0,0,1,col*11,col));

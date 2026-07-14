@@ -31,8 +31,9 @@ static AddrVec_t A(int ch,int pch,int bg,int ba,int row,int col){
 static const char* KNOWN_JSON = R"JSON(
 {
   "hbm_id": 7,
-  "K": 10,
+  "K": 65,
   "config": {"rows_per_bank":16384,"total_spare_rows":4,"sram_slots":16,
+             "vacuum_limit":128,"bursts_per_row":32,
              "num_channels":8,"num_pch":2,"num_bg":4,"num_ba":4},
   "layer_d_bad_banks": [ {"ch":0,"pch":0,"bg":0,"ba":0} ],
   "layer_a_sram": [ {"ch":3,"pch":1,"bg":0,"ba":2,"row":500,"sram_slot":6} ],
@@ -40,7 +41,7 @@ static const char* KNOWN_JSON = R"JSON(
     { "ch":4,"pch":0,"bg":1,"ba":3,
       "layer_b_ded_rows": [300, 305],
       "layer_c_burst": [ {"row":600,"col_start":8,"length":4,"target_slot":2},
-                         {"row":600,"col_start":40,"length":2,"target_slot":70} ] }
+                         {"row":600,"col_start":20,"length":2,"target_slot":40} ] }
   ]
 }
 )JSON";
@@ -55,7 +56,7 @@ int main(int argc, char** argv) {
     std::cout << "== Known-JSON load & parse ==\n";
     check(loaded, "load_from_json returns true");
     check(t.hbm_id == 7, "hbm_id == 7");
-    check(t.K == 10, "K == 10");
+    check(t.K == 65, "K == exact runtime reservation 65");
     check(t.cfg.num_channels==8 && t.cfg.num_pch==2 && t.cfg.num_bg==4 && t.cfg.num_ba==4
           && t.cfg.rows_per_bank==16384, "config block parsed (geometry)");
     check(t.bad_bank_set.size() == 1 && t.bad_bank_set.count({0,0,0,0})==1, "Layer D: {(0,0,0,0)}");
@@ -63,12 +64,32 @@ int main(int argc, char** argv) {
     check(t.ded_row_map.size()==2 && t.ded_row_map.at({4,0,1,3,300})==0
           && t.ded_row_map.at({4,0,1,3,305})==1, "Layer B: rows 300->off0, 305->off1");
     check(t.burst_map.size()==2, "Layer C: 2 burst segments");
-    if (t.burst_map.count({4,0,1,3,600,8}) && t.burst_map.count({4,0,1,3,600,40})) {
+    if (t.burst_map.count({4,0,1,3,600,8}) && t.burst_map.count({4,0,1,3,600,20})) {
         const BurstEntry& b0 = t.burst_map.at({4,0,1,3,600,8});
-        const BurstEntry& b1 = t.burst_map.at({4,0,1,3,600,40});
+        const BurstEntry& b1 = t.burst_map.at({4,0,1,3,600,20});
         check(b0.length==4 && b0.target_slot==2, "Layer C seg0 len4 slot2");
-        check(b1.length==2 && b1.target_slot==70, "Layer C seg1 len2 slot70");
+        check(b1.length==2 && b1.target_slot==40, "Layer C seg1 len2 slot40");
     } else { check(false, "Layer C keys present"); }
+
+    // Invalid tables must fail atomically: the caller keeps the last known-good
+    // table instead of receiving partially parsed state.
+    std::cout << "== Invalid-table rejection ==\n";
+    auto invalid_load = [&](std::string body, const std::string& from,
+                            const std::string& to, const std::string& name) {
+        const auto pos = body.find(from);
+        if (pos == std::string::npos) { check(false, name + " fixture"); return; }
+        body.replace(pos, from.size(), to);
+        { std::ofstream o(known_path); o << body; }
+        const int old_id = t.hbm_id;
+        const auto old_bad = t.bad_bank_set;
+        check(!HbmRepairTable::load_from_json(known_path, t) &&
+              t.hbm_id == old_id && t.bad_bank_set == old_bad, name);
+    };
+    invalid_load(KNOWN_JSON, "\"K\": 65", "\"K\": 64",
+                 "reject inexact K without mutating output");
+    invalid_load(KNOWN_JSON, "\"col_start\":20", "\"col_start\":10",
+                 "reject overlapping Layer C source ranges");
+    { std::ofstream o(known_path); o << KNOWN_JSON; }
 
     // ---- loaded table drives translate() correctly -------------------------
     std::cout << "== Loaded table -> translate() ==\n";
@@ -90,12 +111,12 @@ int main(int argc, char** argv) {
     exp(A(3,1,0,2, 500,7), RepairType::LAYER_A, A(3,1,0,2, RPB+t.cfg.total_spare_rows+6, 7), "A slot6");
     exp(A(4,0,1,3, 300,1), RepairType::LAYER_B, A(4,0,1,3, RPB+0, 1), "B row300 off0");
     exp(A(4,0,1,3, 305,1), RepairType::LAYER_B, A(4,0,1,3, RPB+1, 1), "B row305 off1");
-    exp(A(4,0,1,3, 600,9), RepairType::LAYER_C, A(4,0,1,3, RPB+t.cfg.ded_count+0, 2), "C seg0 slot2");
-    exp(A(4,0,1,3, 600,41),RepairType::LAYER_C, A(4,0,1,3, RPB+t.cfg.ded_count+1, 6), "C seg1 slot70 frag1");
+    exp(A(4,0,1,3, 600,9), RepairType::LAYER_C, A(4,0,1,3, RPB+t.cfg.ded_count+0, 3), "C seg0 preserves offset");
+    exp(A(4,0,1,3, 600,21),RepairType::LAYER_C, A(4,0,1,3, RPB+t.cfg.ded_count+1, 9), "C seg1 preserves offset in frag1");
     std::remove(known_path.c_str());
 
     // ---- (b) real repairv2 sample is consumable ----------------------------
-    std::string real = (argc > 1) ? argv[1] : "json/remap_hbm3_404.json";
+    std::string real = (argc > 1) ? argv[1] : "";
     std::cout << "== Real repairv2 sample (" << real << ") ==\n";
     std::ifstream probe(real);
     if (!probe.good()) {

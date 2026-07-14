@@ -23,88 +23,136 @@ bool HbmRepairTable::load_from_json(const std::string& path, HbmRepairTable& out
     return false;
   }
 
-  json j;
   try {
+    json j;
     f >> j;
-  } catch (const json::parse_error& e) {
-    std::cerr << "[RepairTable] JSON parse error: " << e.what() << "\n";
-    return false;
-  }
+    HbmRepairTable tmp;
+    auto fail = [](const std::string& msg) -> void { throw std::runtime_error(msg); };
+    auto power2 = [](int v) { return v > 0 && (v & (v - 1)) == 0; };
 
-  out.hbm_id = j.value("hbm_id", -1);
-  out.K      = j.value("K",       0);
-
-  // Optional "config" block. When present it makes the table self-describing
-  // (spare-row base addresses and Layer D geometry no longer depend on the
-  // compiled-in defaults matching the repairv2 run). Absent -> keep defaults.
-  if (j.contains("config")) {
-    const auto& c = j["config"];
-    RepairConfig& cfg = out.cfg;
-    cfg.total_spare_rows = c.value("total_spare_rows", cfg.total_spare_rows);
-    cfg.bursts_per_row   = c.value("bursts_per_row",   cfg.bursts_per_row);
-    cfg.sram_slots       = c.value("sram_slots",       cfg.sram_slots);
-    cfg.rows_per_bank    = c.value("rows_per_bank",    cfg.rows_per_bank);
-    cfg.num_channels     = c.value("num_channels",     cfg.num_channels);
-    cfg.num_pch          = c.value("num_pch",          cfg.num_pch);
-    cfg.num_bg           = c.value("num_bg",           cfg.num_bg);
-    cfg.num_ba           = c.value("num_ba",           cfg.num_ba);
+    tmp.hbm_id = j.at("hbm_id").get<int>();
+    tmp.K      = j.at("K").get<int>();
+    const auto& c = j.at("config");
+    RepairConfig& cfg = tmp.cfg;
+    cfg.total_spare_rows = c.at("total_spare_rows").get<int>();
+    cfg.bursts_per_row   = c.at("bursts_per_row").get<int>();
+    cfg.sram_slots       = c.at("sram_slots").get<int>();
+    cfg.rows_per_bank    = c.at("rows_per_bank").get<int>();
+    cfg.vacuum_limit     = c.at("vacuum_limit").get<int>();
+    cfg.num_channels     = c.at("num_channels").get<int>();
+    cfg.num_pch          = c.at("num_pch").get<int>();
+    cfg.num_bg           = c.at("num_bg").get<int>();
+    cfg.num_ba           = c.at("num_ba").get<int>();
     cfg.ded_count        = cfg.total_spare_rows / 2;
     cfg.frag_count       = cfg.total_spare_rows - cfg.ded_count;
-  }
+    if (tmp.hbm_id < 0 || tmp.K < 0 || cfg.total_spare_rows < 0 ||
+        cfg.sram_slots < 0 || cfg.vacuum_limit < 0 ||
+        !power2(cfg.bursts_per_row) || !power2(cfg.rows_per_bank) ||
+        !power2(cfg.num_channels) || !power2(cfg.num_pch) ||
+        !power2(cfg.num_bg) || !power2(cfg.num_ba))
+      fail("invalid config or negative repair-table metadata");
 
-  if (j.contains("layer_d_bad_banks")) {
-    for (auto& e : j["layer_d_bad_banks"]) {
-      int ch  = e["ch"].get<int>();
-      int pch = e["pch"].get<int>();
-      int bg  = e["bg"].get<int>();
-      int ba  = e["ba"].get<int>();
-      out.bad_bank_set.insert({ch, pch, bg, ba});
+    auto valid_bank = [&](int ch, int pch, int bg, int ba) {
+      return ch >= 0 && ch < cfg.num_channels && pch >= 0 && pch < cfg.num_pch &&
+             bg >= 0 && bg < cfg.num_bg && ba >= 0 && ba < cfg.num_ba;
+    };
+    const auto& bad_json = j.at("layer_d_bad_banks");
+    if (!bad_json.is_array()) fail("layer_d_bad_banks must be an array");
+    for (const auto& e : bad_json) {
+      int ch=e.at("ch").get<int>(), pch=e.at("pch").get<int>();
+      int bg=e.at("bg").get<int>(), ba=e.at("ba").get<int>();
+      if (!valid_bank(ch,pch,bg,ba)) fail("Layer D bank is out of range");
+      if (!tmp.bad_bank_set.insert({ch,pch,bg,ba}).second)
+        fail("duplicate Layer D bank");
     }
-  }
 
-  if (j.contains("layer_a_sram")) {
-    for (auto& e : j["layer_a_sram"]) {
-      int ch   = e["ch"].get<int>();
-      int pch  = e["pch"].get<int>();
-      int bg   = e["bg"].get<int>();
-      int ba   = e["ba"].get<int>();
-      int row  = e["row"].get<int>();
-      int slot = e["sram_slot"].get<int>();
-      out.sram_full_map[{ch, pch, bg, ba, row}] = slot;
+    std::set<std::pair<int,int>> used_sram_slots;
+    const auto& sram_json = j.at("layer_a_sram");
+    if (!sram_json.is_array()) fail("layer_a_sram must be an array");
+    for (const auto& e : sram_json) {
+      int ch=e.at("ch").get<int>(), pch=e.at("pch").get<int>();
+      int bg=e.at("bg").get<int>(), ba=e.at("ba").get<int>();
+      int row=e.at("row").get<int>(), slot=e.at("sram_slot").get<int>();
+      BankKey bk{ch,pch,bg,ba};
+      RowKey rk{ch,pch,bg,ba,row};
+      if (!valid_bank(ch,pch,bg,ba) || row < 0 || row >= cfg.rows_per_bank ||
+          slot < 0 || slot >= cfg.sram_slots || tmp.bad_bank_set.count(bk))
+        fail("Layer A entry is out of range or belongs to a dead bank");
+      if (!tmp.sram_full_map.emplace(rk, slot).second)
+        fail("duplicate Layer A row");
+      if (!used_sram_slots.insert({ch,slot}).second)
+        fail("Layer A SRAM slot reused within a channel");
     }
-  }
 
-  if (j.contains("banks")) {
-    for (auto& bank_entry : j["banks"]) {
-      int ch  = bank_entry["ch"].get<int>();
-      int pch = bank_entry["pch"].get<int>();
-      int bg  = bank_entry["bg"].get<int>();
-      int ba  = bank_entry["ba"].get<int>();
-
-      
-      if (bank_entry.contains("layer_b_ded_rows")) {
-        int offset = 0;
-        for (auto& row_val : bank_entry["layer_b_ded_rows"]) {
-          int row = row_val.get<int>();
-          out.ded_row_map[{ch, pch, bg, ba, row}] = offset++;
-        }
+    std::set<BankKey> seen_bank_records;
+    std::map<BankKey,std::set<int>> used_burst_slots;
+    std::map<RowKey,std::set<int>> used_source_cols;
+    const auto& banks_json = j.at("banks");
+    if (!banks_json.is_array()) fail("banks must be an array");
+    for (const auto& bank_entry : banks_json) {
+      int ch=bank_entry.at("ch").get<int>(), pch=bank_entry.at("pch").get<int>();
+      int bg=bank_entry.at("bg").get<int>(), ba=bank_entry.at("ba").get<int>();
+      BankKey bk{ch,pch,bg,ba};
+      if (!valid_bank(ch,pch,bg,ba) || tmp.bad_bank_set.count(bk))
+        fail("Layer B/C bank is out of range or dead");
+      if (!seen_bank_records.insert(bk).second)
+        fail("duplicate Layer B/C bank record");
+      int offset = 0;
+      for (const auto& row_val : bank_entry.at("layer_b_ded_rows")) {
+        int row = row_val.get<int>();
+        RowKey rk{ch,pch,bg,ba,row};
+        if (row < 0 || row >= cfg.rows_per_bank || offset >= cfg.ded_count ||
+            !tmp.ded_row_map.emplace(rk, offset).second)
+          fail("invalid or duplicate Layer B row");
+        ++offset;
       }
-
-      
-      if (bank_entry.contains("layer_c_burst")) {
-        for (auto& burst_val : bank_entry["layer_c_burst"]) {
-          BurstEntry be;
-          be.row         = burst_val["row"].get<int>();
-          be.col_start   = burst_val["col_start"].get<int>();
-          be.length      = burst_val["length"].get<int>();
-          be.target_slot = burst_val["target_slot"].get<int>();
-          out.burst_map[{ch, pch, bg, ba, be.row, be.col_start}] = be;
-        }
+      for (const auto& burst_val : bank_entry.at("layer_c_burst")) {
+        BurstEntry be;
+        be.row=burst_val.at("row").get<int>();
+        be.col_start=burst_val.at("col_start").get<int>();
+        be.length=burst_val.at("length").get<int>();
+        be.target_slot=burst_val.at("target_slot").get<int>();
+        BurstKey key{ch,pch,bg,ba,be.row,be.col_start};
+        if (be.row < 0 || be.row >= cfg.rows_per_bank || be.col_start < 0 ||
+            be.length <= 0 || be.col_start + be.length > cfg.bursts_per_row ||
+            be.target_slot < 0 ||
+            be.target_slot + be.length > cfg.frag_count * cfg.bursts_per_row ||
+            !tmp.burst_map.emplace(key, be).second)
+          fail("invalid or duplicate Layer C range");
+        for (int slot=be.target_slot; slot<be.target_slot+be.length; ++slot)
+          if (!used_burst_slots[bk].insert(slot).second)
+            fail("Layer C target slot reused within a bank");
+        RowKey rk{ch,pch,bg,ba,be.row};
+        for (int col=be.col_start; col<be.col_start+be.length; ++col)
+          if (!used_source_cols[rk].insert(col).second)
+            fail("Layer C source ranges overlap within a row");
       }
     }
-  }
 
-  return true;
+    // A/B/C are mutually exclusive at row granularity.
+    for (const auto& [rk, slot] : tmp.sram_full_map)
+      if (tmp.ded_row_map.count(rk)) fail("row appears in both Layer A and B");
+    for (const auto& [key, be] : tmp.burst_map) {
+      auto [ch,pch,bg,ba,row,col] = key;
+      RowKey rk{ch,pch,bg,ba,row};
+      if (tmp.sram_full_map.count(rk) || tmp.ded_row_map.count(rk))
+        fail("row appears in Layer C and a whole-row repair layer");
+    }
+
+    const int F = static_cast<int>(tmp.bad_bank_set.size());
+    const int L = cfg.total_banks() - F;
+    if (L <= 0) fail("repair table has no live banks");
+    const int h = (cfg.rows_per_bank + L - 1) / L;
+    const long long required = 1LL * F * h;
+    if (required != tmp.K) fail("K does not equal F*ceil(rows_per_bank/live_banks)");
+    if (required > cfg.vacuum_limit) fail("repair table exceeds vacuum_limit");
+
+    out = std::move(tmp);
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[RepairTable] invalid JSON/table: " << e.what() << "\n";
+    return false;
+  }
 }
 
 void HbmRepairTable::print_summary(std::ostream& os) const {
@@ -123,7 +171,7 @@ void HbmRepairTable::print_summary(std::ostream& os) const {
 void HbmRepairTable::print_detail(std::ostream& os) const {
   print_summary(os);
 
-  os << "\n[Table 1] Layer D ??? Bad Banks (" << bad_bank_set.size() << " total)\n";
+  os << "\n[Table 1] Layer D Bad Banks (" << bad_bank_set.size() << " total)\n";
   os << "  idx |  ch  pch   bg   ba\n";
   os << "  ----+--------------------\n";
   int i = 0;
@@ -135,7 +183,7 @@ void HbmRepairTable::print_detail(std::ostream& os) const {
        << std::setw(3) << ba  << "\n";
   }
 
-  os << "\n[Table 2] Layer A ??? SRAM Map (" << sram_full_map.size() << " total)\n";
+  os << "\n[Table 2] Layer A SRAM Map (" << sram_full_map.size() << " total)\n";
   os << "  idx |  ch  pch   bg   ba    row  slot\n";
   os << "  ----+---------------------------------\n";
   i = 0;
@@ -150,7 +198,7 @@ void HbmRepairTable::print_detail(std::ostream& os) const {
        << std::setw(3) << slot << "\n";
   }
 
-  os << "\n[Table 3] Layer B ??? DED Rows (" << ded_row_map.size() << " total)\n";
+  os << "\n[Table 3] Layer B DED Rows (" << ded_row_map.size() << " total)\n";
   os << "  idx |  ch  pch   bg   ba    row  spare_offset\n";
   os << "  ----+------------------------------------------\n";
   i = 0;
@@ -165,7 +213,7 @@ void HbmRepairTable::print_detail(std::ostream& os) const {
        << std::setw(3) << offset << "\n";
   }
 
-  os << "\n[Table 4] Layer C ??? Burst Segments (" << burst_map.size() << " total)\n";
+  os << "\n[Table 4] Layer C Burst Segments (" << burst_map.size() << " total)\n";
   os << "  idx |  ch  pch   bg   ba    row  col_start  len  slot\n";
   os << "  ----+--------------------------------------------------\n";
   i = 0;

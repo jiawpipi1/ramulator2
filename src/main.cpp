@@ -110,6 +110,7 @@ int main(int argc, char* argv[]) {
       }
     } else {
       spdlog::error("Failed to load repair table from: {}", repair_path);
+      return 1;
     }
   } else {
     spdlog::warn("No repair_table_path specified. Repair table skipped.");

@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../../.."          # -> ramulator2/
 
 RAM=./build_new/ramulator2
-JSON="${1:-/home/pitsaiyang/work/my_work/Fault_yield/remap_json_hbm3/remap_hbm_1001.json}"
+JSON="${1:-/home/pitsaiyang/work/my_work/ramulator2/json/remap_hbm3_smoke.json}"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -91,7 +91,8 @@ TMP="$TMP" python3 - <<'PY'
 import json, os, re, sys
 tmp = os.environ["TMP"]
 out = open(f"{tmp}/out.txt").read()
-exp = json.load(open(f"{tmp}/expect.json"))["expect"]
+prediction = json.load(open(f"{tmp}/expect.json"))
+exp = prediction["expect"]
 got = {k: sum(int(m.group(1))
               for m in re.finditer(rf"repair_{k}_\d+:\s*(\d+)", out)) for k in exp}
 
@@ -108,4 +109,23 @@ if ok:
 else:
     print("FAIL: Ramulator does not match the independent prediction")
     sys.exit(1)
+
+# This is the regression for the former Layer-D routing bug. A dead-bank request
+# can move to another channel, and Layer A must bypass DRAM entirely. Comparing
+# each controller's accepted-read count proves translation happened before
+# controller selection; aggregate repair counts alone cannot prove that.
+expected_channels = prediction["dram_channel_reads"]
+actual_channels = []
+for ch in range(len(expected_channels)):
+    matches = re.findall(rf"num_read_reqs_{ch}:\s*(\d+)", out)
+    actual_channels.append(sum(map(int, matches)))
+if expected_channels != actual_channels:
+    print(f"FAIL: target-controller reads expected {expected_channels}")
+    print(f"                              got {actual_channels}")
+    sys.exit(1)
+cross_channel = any(d["ch"] != d["target_ch"] for d in prediction["detail"])
+if not cross_channel:
+    print("FAIL: fixture did not exercise cross-channel relocation")
+    sys.exit(1)
+print(f"PASS: target-controller routing verified {actual_channels}")
 PY

@@ -21,12 +21,33 @@ $CXX $STD $INC_STUB $INC_SRC $INC_EXT \
     src/dram_controller/impl/repair/repair_table.cpp \
     -o tests/repair/test_json_roundtrip
 
+echo "== building validate_repair_directory =="
+$CXX $STD $INC_STUB $INC_SRC $INC_EXT \
+    tests/repair/validate_repair_directory.cpp \
+    src/dram_controller/impl/repair/repair_table.cpp \
+    -o tests/repair/validate_repair_directory
+
+echo "== building test_req_buffer =="
+$CXX $STD $INC_STUB $INC_SRC \
+    tests/repair/test_req_buffer.cpp src/base/request.cpp \
+    -o tests/repair/test_req_buffer
+
 rc=0
 echo; echo "== running test_repair_translator =="
 ./tests/repair/test_repair_translator || rc=1
 echo; echo "== running test_json_roundtrip =="
-# optional arg: path to a real repairv2 sample (defaults to json/remap_hbm3_404.json)
-./tests/repair/test_json_roundtrip "${1:-json/remap_hbm3_404.json}" || rc=1
+# optional arg: path to a freshly generated repairv2 sample
+if [ "$#" -gt 0 ]; then
+  ./tests/repair/test_json_roundtrip "$1" || rc=1
+else
+./tests/repair/test_json_roundtrip || rc=1
+fi
+
+echo; echo "== running offline pipeline regressions =="
+python3 tests/repair/test_offline_pipeline.py || rc=1
+
+echo; echo "== running ReqBuffer capacity regression =="
+./tests/repair/test_req_buffer || rc=1
 
 echo
 if [ "$rc" -eq 0 ]; then echo "ALL REPAIR TESTS PASSED"; else echo "SOME REPAIR TESTS FAILED"; fi

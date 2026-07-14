@@ -4,6 +4,8 @@
 #include <vector>
 #include <list>
 #include <string>
+#include <array>
+#include <functional>
 
 #include "base/base.h"
 
@@ -57,7 +59,7 @@ struct ReqBuffer {
   size_t size() const { return buffer.size(); }
 
   bool enqueue(const Request& request) {
-    if (buffer.size() <= max_size) {
+    if (buffer.size() < max_size) {
       buffer.push_back(request);
       return true;
     } else {

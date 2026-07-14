@@ -74,6 +74,7 @@ class IMemorySystem : public TopLevel<IMemorySystem> {
     // virtual const SpecDef& get_supported_requests() = 0;
 
     virtual float get_tCK() { return -1.0f; };
+    virtual int get_transaction_size() { return -1; };
 };
 
 }        // namespace Ramulator

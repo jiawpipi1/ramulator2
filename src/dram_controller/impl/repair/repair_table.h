@@ -38,11 +38,12 @@ struct BurstEntry {
 
 struct RepairConfig {
   int total_spare_rows = 4;
-  int bursts_per_row   = 64;
+  int bursts_per_row   = 32;
   int ded_count        = 2;  // total_spare_rows / 2
   int frag_count       = 2;  // total_spare_rows - ded_count
   int sram_slots       = 16;
   int rows_per_bank    = 16384;
+  int vacuum_limit     = 32;
 
   // Bank geometry (needed by Layer D to enumerate live banks).
   // A die's banks are (ch, pch, bg, ba); ly = bg*num_pch + pch matches the

@@ -28,6 +28,11 @@ class LinearMapperBase : public IAddrMapper {
       m_num_levels = count.size();
       m_addr_bits.resize(m_num_levels);
       for (size_t level = 0; level < m_addr_bits.size(); level++) {
+        if (count[level] <= 0 || (count[level] & (count[level] - 1)) != 0) {
+          throw ConfigurationError(
+              "Linear address mappers require power-of-two organization counts; "
+              "level {} has count {}!", level, count[level]);
+        }
         m_addr_bits[level] = calc_log2(count[level]);
       }
 
@@ -35,6 +40,11 @@ class LinearMapperBase : public IAddrMapper {
       m_addr_bits[m_num_levels - 1] -= calc_log2(m_dram->m_internal_prefetch_size);
 
       int tx_bytes = m_dram->m_internal_prefetch_size * m_dram->m_channel_width / 8;
+      if (tx_bytes <= 0 || (tx_bytes & (tx_bytes - 1)) != 0) {
+        throw ConfigurationError(
+            "Linear address mappers require a power-of-two transaction size; got {} bytes!",
+            tx_bytes);
+      }
       m_tx_offset = calc_log2(tx_bytes);
 
       // Determine where are the row and col bits for ChRaBaRoCo and RoBaRaCoCh
@@ -160,6 +170,10 @@ class LineRoBaRaCoCh final : public LinearMapperBase, public Implementation {
         throw ConfigurationError(
             "LineRoBaRaCoCh: line_size ({}) must be a multiple of the "
             "transaction size ({})!", m_line_size, tx_bytes);
+      }
+      if ((m_line_size & (m_line_size - 1)) != 0) {
+        throw ConfigurationError(
+            "LineRoBaRaCoCh: line_size ({}) must be a power of two!", m_line_size);
       }
       m_line_bits = calc_log2(m_line_size / tx_bytes);
       if (m_line_bits > m_addr_bits[m_col_bits_idx]) {

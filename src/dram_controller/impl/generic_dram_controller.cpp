@@ -1,9 +1,6 @@
-#include <list>
-#include <utility>
 #include "dram_controller/controller.h"
 #include "memory_system/memory_system.h"
-#include "dram_controller/impl/repair/repair_translator.h"
-#include "dram_controller/impl/repair/repair_table.h"
+#include "dram_controller/impl/repair/repair_debug.h"
 
 namespace Ramulator {
 
@@ -52,24 +49,8 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
     size_t s_read_latency = 0;
     float s_avg_read_latency = 0;
-    // [ADD] Repair stats
-    std::unique_ptr<RepairTranslator> m_repair_translator;
-    int m_sram_read_latency = 6;  // 保留但不用於 timing，只供統計參考
-    size_t s_repair_none    = 0;
-    size_t s_repair_layer_a = 0;
-    size_t s_repair_layer_b = 0;
-    size_t s_repair_layer_c = 0;
-    size_t s_repair_layer_d = 0;
-    size_t s_bloom_reject   = 0;
-    size_t s_bloom_maybe    = 0;
-    int    m_repair_lookup_latency = 0;
-    std::list<std::pair<Clk_t, Request>> m_repair_pipeline;
-    HbmRepairTable m_repair_table;  
-
-
   public:
     void init() override {
-      m_repair_lookup_latency = param<int>("repair_lookup_latency").default_val(0);
       m_wr_low_watermark =  param<float>("wr_low_watermark").desc("Threshold for switching back to read mode.").default_val(0.2f);
       m_wr_high_watermark = param<float>("wr_high_watermark").desc("Threshold for switching to write mode.").default_val(0.8f);
 
@@ -81,18 +62,6 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         YAML::Node plugin_configs = m_config["plugins"];
         for (YAML::iterator it = plugin_configs.begin(); it != plugin_configs.end(); ++it) {
           m_plugins.push_back(create_child_ifce<IControllerPlugin>(*it));
-        }
-      }
-      // add
-      if (auto path = param<std::string>("repair_table_path").optional()) {
-        if (!HbmRepairTable::load_from_json(*path, m_repair_table)) {  // ← 用 member
-            spdlog::error("Failed to load repair table: {}", *path);
-        } else {
-            bool enable_bloom = param<bool>("repair_enable_bloom").default_val(true);
-        if (param<bool>("repair_debug_addr").default_val(false)) {
-          g_debug_address.store(true, std::memory_order_relaxed);
-        }
-            m_repair_translator = std::make_unique<RepairTranslator>(m_repair_table, enable_bloom);
         }
       }
     };
@@ -117,14 +86,6 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       register_stat(s_write_row_hits).name("write_row_hits_{}", m_channel_id);
       register_stat(s_write_row_misses).name("write_row_misses_{}", m_channel_id);
       register_stat(s_write_row_conflicts).name("write_row_conflicts_{}", m_channel_id);
-      // [ADD]
-      register_stat(s_repair_none   ).name("repair_none_{}",    m_channel_id);
-      register_stat(s_repair_layer_a).name("repair_layer_a_{}", m_channel_id);
-      register_stat(s_repair_layer_b).name("repair_layer_b_{}", m_channel_id);
-      register_stat(s_repair_layer_c).name("repair_layer_c_{}", m_channel_id);
-      register_stat(s_repair_layer_d).name("repair_layer_d_{}", m_channel_id);
-      register_stat(s_bloom_reject).name("bloom_reject_{}", m_channel_id);
-      register_stat(s_bloom_maybe ).name("bloom_maybe_{}",  m_channel_id);
       for (size_t core_id = 0; core_id < m_num_cores; core_id++) {
         register_stat(s_read_row_hits_per_core[core_id]).name("read_row_hits_core_{}", core_id);
         register_stat(s_read_row_misses_per_core[core_id]).name("read_row_misses_core_{}", core_id);
@@ -148,52 +109,7 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
     };
 
     bool send(Request& req) override {
-      // [ADD] Repair translation：只改 addr_vec，timing 完全不動
-      // Layer A 也一樣：addr_vec 換到 SRAM 對應位置，走正常 DRAM pipeline
-      if (m_repair_translator) {
-          Addr_t raw = req.addr;
-          if (g_debug_address.load(std::memory_order_relaxed)) {
-              std::cerr << "[ADDR-DBG-PRE] req.addr = " << raw
-                      << " (0x" << std::hex << raw << std::dec << ")\n";
-          }
-          RepairType rtype = m_repair_translator->translate(req.addr_vec, raw);
-          switch (rtype) {
-              case RepairType::NONE:    s_repair_none++;    break;
-              case RepairType::LAYER_A: s_repair_layer_a++; break;  // addr已換，繼續走
-              case RepairType::LAYER_B: s_repair_layer_b++; break;
-              case RepairType::LAYER_C: s_repair_layer_c++; break;
-              case RepairType::LAYER_D: s_repair_layer_d++; break;
-          }
-          if (m_repair_translator->last_bloom_reject()) s_bloom_reject++;
-          else                                          s_bloom_maybe++;
-          // 所有 layer 都繼續往下走，不 return，不改 depart
-      }
-      // [ADD END]
       req.final_command = m_dram->m_request_translations(req.type_id);
-
-      switch (req.type_id) {
-        case Request::Type::Read: {
-          s_num_read_reqs++;
-          break;
-        }
-        case Request::Type::Write: {
-          s_num_write_reqs++;
-          break;
-        }
-        default: {
-          s_num_other_reqs++;
-          break;
-        }
-      }
-
-      // [ADD] repair lookup latency: hold the translated request until the
-      // lookup completes; req.arrive keeps the true arrival cycle so
-      // read_latency includes any lookup delay NOT hidden by queueing.
-      if (m_repair_translator && m_repair_lookup_latency > 0) {
-        req.arrive = m_clk;
-        m_repair_pipeline.push_back({m_clk + m_repair_lookup_latency, req});
-        return true;
-      }
 
       // Forward existing write requests to incoming read requests
       if (req.type_id == Request::Type::Read) {
@@ -204,13 +120,14 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
           // The request will depart at the next cycle
           req.depart = m_clk + 1;
           pending.push_back(req);
+          ++s_num_read_reqs;
           return true;
         }
       }
 
       // Else, enqueue them to corresponding buffer based on request type id
       bool is_success = false;
-      req.arrive = m_clk;
+      if (req.arrive < 0) req.arrive = m_clk;
       if        (req.type_id == Request::Type::Read) {
         is_success = m_read_buffer.enqueue(req);
       } else if (req.type_id == Request::Type::Write) {
@@ -223,6 +140,9 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
         req.arrive = -1;
         return false;
       }
+
+      if (req.type_id == Request::Type::Read) ++s_num_read_reqs;
+      else                                    ++s_num_write_reqs;
 
       return true;
     };
@@ -237,16 +157,6 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
     void tick() override {
       m_clk++;
-
-      // drain repair-lookup pipeline: enqueue requests whose lookup completed
-      for (auto _pit = m_repair_pipeline.begin(); _pit != m_repair_pipeline.end(); ) {
-        if (_pit->first <= m_clk) {
-          Request& _r = _pit->second;
-          bool _ok = (_r.type_id == Request::Type::Read)  ? m_read_buffer.enqueue(_r)
-                   : (_r.type_id == Request::Type::Write) ? m_write_buffer.enqueue(_r) : false;
-          if (_ok) _pit = m_repair_pipeline.erase(_pit); else ++_pit;
-        } else { ++_pit; }
-      }
 
       // Update statistics
       s_queue_len += m_read_buffer.size() + m_write_buffer.size() + m_priority_buffer.size() + pending.size();

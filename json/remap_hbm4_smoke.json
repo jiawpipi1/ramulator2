@@ -1,0 +1,41 @@
+{
+  "hbm_id": 0,
+  "K": 17,
+  "config": {
+    "rows_per_bank": 16384,
+    "total_spare_rows": 4,
+    "sram_slots": 16,
+    "vacuum_limit": 512,
+    "bursts_per_row": 32,
+    "num_channels": 32,
+    "num_pch": 2,
+    "num_bg": 4,
+    "num_ba": 4
+  },
+  "layer_d_bad_banks": [
+    {"ch": 0, "pch": 0, "bg": 0, "ba": 0}
+  ],
+  "layer_a_sram": [
+    {"ch": 1, "pch": 0, "bg": 0, "ba": 0, "row": 100, "sram_slot": 0}
+  ],
+  "banks": [
+    {
+      "ch": 2,
+      "pch": 0,
+      "bg": 0,
+      "ba": 0,
+      "layer_b_ded_rows": [200],
+      "layer_c_burst": []
+    },
+    {
+      "ch": 3,
+      "pch": 0,
+      "bg": 0,
+      "ba": 0,
+      "layer_b_ded_rows": [],
+      "layer_c_burst": [
+        {"row": 300, "col_start": 7, "length": 3, "target_slot": 4}
+      ]
+    }
+  ]
+}

@@ -10,4 +10,5 @@
 namespace Ramulator {
 using Addr_t    = int64_t;
 using AddrVec_t = std::vector<int>;
+using Clk_t     = int64_t;
 }

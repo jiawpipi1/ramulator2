@@ -84,9 +84,19 @@ class Table:
             for e in b.get("layer_c_burst", []):
                 self.burst.setdefault(k + (e["row"],), []).append(e)
 
+        self.live = []
+        for ch in range(self.cfg["num_channels"]):
+            for bg in range(self.cfg["num_bg"]):
+                for pch in range(self.cfg["num_pch"]):
+                    for ba in range(self.cfg["num_ba"]):
+                        bank = (ch, pch, bg, ba)
+                        if bank not in self.bad:
+                            self.live.append(bank)
+        self.dead = sorted(self.bad, key=lambda x: (x[0], x[2], x[1], x[3]))
+
     def classify(self, ch, pch, bg, ba, row, col):
         """Re-implement RepairTranslator::translate precedence: D, then A/B/C.
-        `col` is an addr_vec column in [0,32); the table stores burst cols 0..63."""
+        `col` and the table use the same addressable transaction-slot units."""
         res = "none"
         if (ch, pch, bg, ba) in self.bad:
             return "layer_d"          # D relocates then falls through; it still reports D
@@ -99,6 +109,22 @@ class Table:
             if e["col_start"] <= col < e["col_start"] + e["length"]:
                 return "layer_c"
         return res
+
+    def route(self, ch, pch, bg, ba, row, col):
+        """Mirror pre-controller D routing and the Layer-A SRAM bypass."""
+        source = (ch, pch, bg, ba)
+        result = "none"
+        if source in self.bad:
+            result = "layer_d"
+            h = (self.cfg["rows_per_bank"] + len(self.live) - 1) // len(self.live)
+            ordinal = self.dead.index(source)
+            ch, pch, bg, ba = self.live[row // h]
+            row = self.cfg["rows_per_bank"] - (ordinal + 1) * h + row % h
+        key = (ch, pch, bg, ba, row)
+        uses_sram = key in self.sram
+        if result == "none":
+            result = self.classify(ch, pch, bg, ba, row, col)
+        return result, ch, uses_sram
 
 
 def main():
@@ -160,7 +186,10 @@ def main():
                 break
             assert e["col_start"] < N_AV_COLS, \
                 f"col_start {e['col_start']} outside addressable columns"
-            add(ch, pch, bg, ba, row, e["col_start"], "layer_c")
+            # Exercise offsets inside multi-column ranges, not only col_start.
+            col = e["col_start"] + (n % e["length"])
+            assert col < N_AV_COLS, f"Layer C range exceeds addressable columns: {e}"
+            add(ch, pch, bg, ba, row, col, "layer_c")
             n += 1
         if n >= a.n:
             break
@@ -190,22 +219,28 @@ def main():
 
     # -- predict the outcome of every request with the mirrored translator
     expect = {"none": 0, "layer_a": 0, "layer_b": 0, "layer_c": 0, "layer_d": 0}
+    dram_channel_reads = [0] * t.cfg["num_channels"]
     detail = []
     for (addr, ch, pch, bg, ba, row, col, intent) in reqs:
-        got = t.classify(ch, pch, bg, ba, row, col)
+        got, target_ch, uses_sram = t.route(ch, pch, bg, ba, row, col)
         expect[got] += 1
+        if not uses_sram:
+            dram_channel_reads[target_ch] += 1
         detail.append({"addr": addr, "ch": ch, "pch": pch, "bg": bg, "ba": ba,
-                       "row": row, "col": col, "intent": intent, "predicted": got})
+                       "row": row, "col": col, "intent": intent, "predicted": got,
+                       "target_ch": target_ch, "uses_layer_a_sram": uses_sram})
 
     with open(a.trace, "w") as f:
         for r in reqs:
             f.write(f"LD {r[0]}\n")
 
-    json.dump({"total": len(reqs), "expect": expect, "detail": detail},
+    json.dump({"total": len(reqs), "expect": expect,
+               "dram_channel_reads": dram_channel_reads, "detail": detail},
               open(a.expect, "w"), indent=1)
 
     print(f"[toy] {len(reqs)} requests -> {a.trace}")
     print(f"[toy] predicted: {expect}")
+    print(f"[toy] predicted DRAM-controller reads: {dram_channel_reads}")
     intents = {}
     for d in detail:
         intents.setdefault(d["intent"], []).append(d["predicted"])

@@ -141,8 +141,10 @@ public:
     size_t bloom_rejects()   const { return m_bloom_reject; }   // fast path taken
     size_t bloom_maybes()    const { return m_bloom_maybe;  }   // full A/B/C lookup done
     bool   last_bloom_reject() const { return m_last_reject; }  // for the most recent translate()
+    bool   last_uses_layer_a_sram() const { return m_last_layer_a; }
 
     RepairType translate(AddrVec_t& av, Addr_t raw_addr = 0) const {
+        m_last_layer_a = false;
         int ch  = av[AIDX_CH];
         int pch = av[AIDX_PCH];
         int bg  = av[AIDX_BG];
@@ -219,6 +221,7 @@ public:
                 if (dbg) std::cerr << "  [Layer A] slot " << it->second
                                    << " -> row " << new_row << "\n";
                 av[AIDX_ROW] = new_row;
+                m_last_layer_a = true;
                 return d_result == RepairType::LAYER_D ? RepairType::LAYER_D
                                                        : RepairType::LAYER_A;
             }
@@ -247,7 +250,8 @@ public:
                 if (kch != ch || kpch != pch || kbg != bg ||
                     kba != ba  || krow != row) break;
                 if (col >= be.col_start && col < be.col_start + be.length) {
-                    auto [new_row, new_col] = m_tbl.burst_slot_to_addr(be.target_slot);
+                    int target = be.target_slot + (col - be.col_start);
+                    auto [new_row, new_col] = m_tbl.burst_slot_to_addr(target);
                     if (dbg) std::cerr << "  [Layer C] slot " << be.target_slot
                                        << " -> row " << new_row << " col " << new_col << "\n";
                     av[AIDX_ROW] = new_row;
@@ -321,6 +325,7 @@ private:
     mutable size_t m_bloom_reject = 0;
     mutable size_t m_bloom_maybe  = 0;
     mutable bool   m_last_reject  = false;
+    mutable bool   m_last_layer_a = false;
 };
 
 } // namespace Ramulator
