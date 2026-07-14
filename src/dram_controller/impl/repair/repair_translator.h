@@ -57,46 +57,81 @@ namespace Ramulator {
 // so hardware needs one small-SRAM read rather than k random reads/ports.
 class BloomFilter {
 public:
+    // A "block" is the unit the hardware reads in ONE SRAM access. All k probes
+    // for a key live inside one block, so a lookup is a single read -- never k
+    // random reads and never a k-ported memory. That is the whole point of a
+    // blocked filter.
+    //
+    // BLOCK SIZE IS 512 BITS (64 B), NOT 64. This was measured, not guessed. A
+    // 64-bit block made the filter 7x worse than the textbook formula predicts:
+    //
+    //   block   bits/key  k   size     measured FP   (worst die 193, 1,972 keys)
+    //     64       12     8   2,960 B     2.178%     <- the old configuration
+    //    512       12     8   3,008 B     0.517%
+    //    512       16     8   3,968 B     0.182%     <- current
+    //   (textbook non-blocked, m/n=12, k=8:  0.31%)
+    //
+    // WHY: keys land in blocks by a hash, so occupancy is Poisson-spread. The
+    // false-positive rate of a block is convex in its occupancy, so the few
+    // overloaded blocks dominate the average -- E[FP] >> FP(E[occupancy]). With
+    // 512-bit blocks the relative spread is far smaller and the filter behaves
+    // close to theory. A 512-bit block is still ONE SRAM row read (contiguous
+    // words), so the fast path costs the same access it always did.
+    //
+    // This matters more than it looks: with the unified front gate, a Bloom
+    // false positive is now essentially the ONLY thing left on the slow path.
+    static constexpr int WORDS_PER_BLOCK = 8;                    // 8 x 64 bits
+    static constexpr int BLOCK_BITS      = WORDS_PER_BLOCK * 64; // = 512
+
     void build(size_t n_keys, int bits_per_key, int k) {
         m_k = (k > 0) ? k : 1;
-        size_t nbits = (n_keys ? n_keys : 1) * (size_t)(bits_per_key > 0 ? bits_per_key : 12);
+        size_t nbits = (n_keys ? n_keys : 1) * (size_t)(bits_per_key > 0 ? bits_per_key : 16);
         if (nbits < 1024) nbits = 1024;
-        m_words.assign((nbits + 63) / 64, 0);
+        m_nblocks = (nbits + BLOCK_BITS - 1) / BLOCK_BITS;
+        if (m_nblocks == 0) m_nblocks = 1;
+        m_words.assign(m_nblocks * WORDS_PER_BLOCK, 0);
         m_nbits = m_words.size() * 64;
     }
     bool built() const { return m_nbits > 0; }
     void insert(uint64_t key) {
-        size_t word;
-        uint64_t mask;
-        location(key, word, mask);
-        m_words[word] |= mask;
+        size_t base;
+        uint64_t masks[WORDS_PER_BLOCK];
+        location(key, base, masks);
+        for (int w = 0; w < WORDS_PER_BLOCK; ++w) m_words[base + w] |= masks[w];
     }
     // true  => key MIGHT be present (do the full lookup)
     // false => key is DEFINITELY absent (safe to skip A/B/C)
     bool maybe_contains(uint64_t key) const {
         if (!built()) return true;               // disabled -> never screens
-        size_t word;
-        uint64_t mask;
-        location(key, word, mask);
-        return (m_words[word] & mask) == mask;
+        size_t base;
+        uint64_t masks[WORDS_PER_BLOCK];
+        location(key, base, masks);
+        for (int w = 0; w < WORDS_PER_BLOCK; ++w)
+            if ((m_words[base + w] & masks[w]) != masks[w]) return false;
+        return true;
     }
-    size_t num_bits() const { return m_nbits; }
+    size_t num_bits()   const { return m_nbits; }
     int    num_hashes() const { return m_k; }
+    size_t num_blocks() const { return m_nblocks; }
 private:
     static uint64_t mix(uint64_t x) {
         x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
         x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33; return x;
     }
-    void location(uint64_t key, size_t& word, uint64_t& mask) const {
-        word = mix(key ^ 0x243f6a8885a308d3ULL) % m_words.size();
+    // One hash selects the block; two more spread k bits inside it.
+    void location(uint64_t key, size_t& base, uint64_t (&masks)[WORDS_PER_BLOCK]) const {
+        base = (mix(key ^ 0x243f6a8885a308d3ULL) % m_nblocks) * WORDS_PER_BLOCK;
         uint64_t first = mix(key ^ 0x9e3779b97f4a7c15ULL);
-        uint64_t step = mix(key ^ 0xc2b2ae3d27d4eb4fULL) | 1ULL;
-        mask = 0;
-        for (int i = 0; i < m_k; ++i)
-            mask |= 1ULL << ((first + (uint64_t)i * step) & 63ULL);
+        uint64_t step  = mix(key ^ 0xc2b2ae3d27d4eb4fULL) | 1ULL;
+        for (int w = 0; w < WORDS_PER_BLOCK; ++w) masks[w] = 0;
+        for (int i = 0; i < m_k; ++i) {
+            uint64_t bit = (first + (uint64_t)i * step) & (uint64_t)(BLOCK_BITS - 1);
+            masks[bit >> 6] |= 1ULL << (bit & 63ULL);
+        }
     }
     std::vector<uint64_t> m_words;
-    size_t m_nbits = 0;
+    size_t m_nbits   = 0;
+    size_t m_nblocks = 0;
     int    m_k = 0;
 };
 
@@ -130,9 +165,13 @@ inline const char* repair_type_name(RepairType t) {
 
 class RepairTranslator {
 public:
+    // 16 bits/key with 512-bit blocks measures 0.182% FP on worst die 193
+    // (3,968 B). See BloomFilter for why the block size, not the bit budget, was
+    // the thing that mattered.
     explicit RepairTranslator(const HbmRepairTable& tbl, bool enable_bloom = true,
-                              int bloom_bits_per_key = 12, int bloom_k = 8)
-        : m_tbl(tbl), m_bloom_enabled(enable_bloom) {
+                              int bloom_bits_per_key = 16, int bloom_k = 8,
+                              bool unified_gate = true)
+        : m_tbl(tbl), m_bloom_enabled(enable_bloom), m_unified_gate(unified_gate) {
         build_bank_lists();
         if (m_bloom_enabled) build_bloom(bloom_bits_per_key, bloom_k);
     }
@@ -146,6 +185,7 @@ public:
 
     // Bloom introspection / stats (cumulative across translate() calls).
     bool   bloom_enabled()   const { return m_bloom_enabled; }
+    bool   unified_gate()    const { return m_unified_gate; }
     size_t bloom_num_bits()  const { return m_bloom.num_bits(); }
     int    bloom_num_hashes()const { return m_bloom.num_hashes(); }
     size_t bloom_rejects()   const { return m_bloom_reject; }   // fast path taken
@@ -153,9 +193,17 @@ public:
     bool   last_bloom_reject() const { return m_last_reject; }  // for the most recent translate()
     bool   last_fast_path() const { return m_last_fast; }       // live bank + Bloom reject
     bool   last_uses_layer_a_sram() const { return m_last_layer_a; }
+    // True when the request was relocated by Layer D AND the relocated row then
+    // ALSO needed an A/B/C repair. The vacuum band is made of ordinary DRAM rows
+    // in live banks, so a relocated access can land on a row that is itself
+    // faulty. That request does real table work and is charged the slow path.
+    // translate() returns LAYER_D for it (D is the outermost layer), so without
+    // this flag the per-layer counters would hide the case entirely.
+    bool   last_layer_d_then_abc() const { return m_last_d_abc; }
 
     RepairType translate(AddrVec_t& av, Addr_t raw_addr = 0) const {
         m_last_layer_a = false;
+        m_last_d_abc = false;
         int ch  = av[AIDX_CH];
         int pch = av[AIDX_PCH];
         int bg  = av[AIDX_BG];
@@ -179,23 +227,18 @@ public:
         const BankKey4 source_bank{ch, pch, bg, ba};
         const bool source_dead = m_tbl.bad_bank_set.count(source_bank) != 0;
 
-        // -- Common front gate ------------------------------------------------
-        // In hardware, source_dead is a tiny bank bitmap/CAM check that can run
-        // beside the Bloom probes. A live-bank Bloom reject proves that neither
-        // D nor A/B/C can apply, so the request returns without exercising the
-        // relocation or full tables. A dead-bank request cannot use this reject:
-        // D changes its bank/row, and the translated key must be checked again.
-        if (m_bloom_enabled && !source_dead) {
-            if (!m_bloom.maybe_contains(bank_row_key(ch, pch, bg, ba, row))) {
-                ++m_bloom_reject;
-                m_last_reject = true;
-                m_last_fast = true;
-                if (dbg) std::cerr << "  [Front gate] live bank + Bloom reject"
-                                   << " -> fast pass-through\n";
-                return RepairType::NONE;
-            }
-            ++m_bloom_maybe;
-        }
+        // -- Front gate: exact dead-bank membership ---------------------------
+        // source_dead is a 512-bit bank bitmap (64 B for HBM3): one bit indexed
+        // by the 9-bit bank key. Exact, no false positives. Layer D is NOT in
+        // the Bloom filter and must not be: a dead bank kills ALL its rows, so
+        // representing it as (bank,row) keys would mean inserting 16384 keys per
+        // dead bank (245,760 for worst die 193) and would swamp a filter sized
+        // for 1,990 A/B/C keys. The bitmap is smaller, exact, and can be read in
+        // parallel with the Bloom.
+        //
+        // Layer D relocation therefore runs BEFORE the Bloom probe, because D
+        // changes the (bank,row) that A/B/C are keyed on. There is exactly ONE
+        // probe per request, on the post-D key.
 
         RepairType d_result = RepairType::NONE;
 
@@ -233,15 +276,37 @@ public:
             }
         }
 
-        // A live-bank Bloom maybe was already counted by the front gate. For a
-        // dead source bank, query the relocated key now; querying only the
-        // original key would introduce false negatives after Layer D.
-        if (m_bloom_enabled && source_dead) {
+        // -- The single Bloom probe, on the POST-D key ------------------------
+        // ch/pch/bg/ba/row are the relocated values if Layer D fired, else the
+        // originals (for a live bank the post-D key IS the original key). A
+        // reject proves no A/B/C entry can apply, so the request is done.
+        //
+        // FAST-PATH CLASSIFICATION. m_unified_gate = true means a Bloom reject
+        // takes the fast path EVEN IF Layer D relocated it. That is the point of
+        // this structure: Layer D is combinational (a bitmap bit, an ordinal, a
+        // live-bank select and a constant-divisor divide) and touches no repair
+        // table, so a relocated request whose target row has no A/B/C entry does
+        // no more table work than a plain pass-through. Previously every
+        // dead-bank access was charged the slow latency, even though ~2.93% of
+        // all banks are dead -- that alone put most of the slow traffic on the
+        // slow path for no lookup reason.
+        //
+        // The hardware assumption this buys: to keep the fast path at one cycle,
+        // the Bloom must be probed with the post-D key without serialising
+        // bitmap -> relocate -> Bloom. Probe BOTH the original and the relocated
+        // key in parallel and let the dead bit mux the result; the blocked filter
+        // is only 2,992 B, so duplicating it (~6 KB) or dual-porting it is cheap.
+        // Set m_unified_gate = false to charge dead banks the slow latency and
+        // measure the conservative bracket.
+        if (m_bloom_enabled) {
             if (!m_bloom.maybe_contains(bank_row_key(ch, pch, bg, ba, row))) {
                 ++m_bloom_reject;
                 m_last_reject = true;
+                m_last_fast = m_unified_gate || !source_dead;
                 if (dbg) std::cerr << "  [Bloom] reject -> skip A/B/C  RESULT: "
-                                   << repair_type_name(d_result) << "\n";
+                                   << repair_type_name(d_result)
+                                   << (m_last_fast ? "  (fast path)" : "  (slow path)")
+                                   << "\n";
                 return d_result;                 // LAYER_D if relocated, else NONE
             }
             ++m_bloom_maybe;                      // fall through to full lookup
@@ -257,6 +322,7 @@ public:
                                    << " -> row " << new_row << "\n";
                 av[AIDX_ROW] = new_row;
                 m_last_layer_a = true;
+                m_last_d_abc = (d_result == RepairType::LAYER_D);
                 return d_result == RepairType::LAYER_D ? RepairType::LAYER_D
                                                        : RepairType::LAYER_A;
             }
@@ -270,6 +336,7 @@ public:
                 if (dbg) std::cerr << "  [Layer B] offset " << it->second
                                    << " -> row " << new_row << "\n";
                 av[AIDX_ROW] = new_row;
+                m_last_d_abc = (d_result == RepairType::LAYER_D);
                 return d_result == RepairType::LAYER_D ? RepairType::LAYER_D
                                                        : RepairType::LAYER_B;
             }
@@ -291,6 +358,7 @@ public:
                                        << " -> row " << new_row << " col " << new_col << "\n";
                     av[AIDX_ROW] = new_row;
                     av[AIDX_COL] = new_col;
+                    m_last_d_abc = (d_result == RepairType::LAYER_D);
                     return d_result == RepairType::LAYER_D ? RepairType::LAYER_D
                                                            : RepairType::LAYER_C;
                 }
@@ -356,12 +424,16 @@ private:
     int m_R = 0, m_num_live = 0, m_num_dead = 0, m_band_h = 0;
 
     bool           m_bloom_enabled = false;
+    // true  = a Bloom reject is fast even when Layer D relocated the request
+    // false = legacy: every dead-bank access pays the slow latency
+    bool           m_unified_gate  = true;
     BloomFilter    m_bloom;
     mutable size_t m_bloom_reject = 0;
     mutable size_t m_bloom_maybe  = 0;
     mutable bool   m_last_reject  = false;
     mutable bool   m_last_fast    = false;
     mutable bool   m_last_layer_a = false;
+    mutable bool   m_last_d_abc   = false;
 };
 
 } // namespace Ramulator

@@ -177,10 +177,89 @@ int main() {
     { AddrVec_t v=A(1,0,0,3,800,5); T.translate(v); check(!T.last_bloom_reject(), "B key -> bloom maybe"); }
     { AddrVec_t v=A(1,0,0,3,900,8); T.translate(v); check(!T.last_bloom_reject(), "C key -> bloom maybe"); }
     { AddrVec_t v=A(1,0,0,3,512,5); T.translate(v); check(!T.last_fast_path(), "A key -> slow lookup path"); }
-    { AddrVec_t v=A(0,0,0,0,123,5); T.translate(v); check(!T.last_fast_path(), "dead bank -> slow lookup path"); }
     // Clean rows should mostly take the fast (reject) path -> that is the power win.
     { size_t fast=0,tot=0; for (int r=0;r<2000;++r){ AddrVec_t v=A(6,0,0,2,r,1); T.translate(v); ++tot; if(T.last_fast_path())++fast; }
       check(fast > tot*9/10, "clean addrs mostly bloom-rejected (fast path >90%)"); }
+
+    // -- The unified front gate ------------------------------------------------
+    // There is ONE Bloom probe per request, on the POST-Layer-D key. A dead-bank
+    // request whose relocated row has no A/B/C entry gets a Bloom reject and does
+    // no repair-table work at all -- Layer D is a bank bitmap plus combinational
+    // address math. So it takes the FAST path. The legacy gate charges every
+    // dead-bank access the slow latency; keep it as the conservative bracket.
+    //
+    // Both gates MUST produce identical addresses and identical RepairTypes --
+    // only the fast/slow classification differs. That is the safety property.
+    {
+        RepairTranslator T_uni(t, true, 12, 8, /*unified_gate=*/true);
+        RepairTranslator T_leg(t, true, 12, 8, /*unified_gate=*/false);
+        check(T_uni.unified_gate() && !T_leg.unified_gate(), "gate flag plumbed through");
+
+        bool same_result = true, uni_fast_seen = false, leg_fast_on_dead = false;
+        for (int r = 0; r < 4000; r += 3) {
+            for (int col : {1, 5, 17}) {
+                AddrVec_t vu = A(0,0,0,0,r,col);   // ch0/pch0/bg0/ba0 is a DEAD bank
+                AddrVec_t vl = vu;
+                RepairType ru = T_uni.translate(vu);
+                RepairType rl = T_leg.translate(vl);
+                if (ru != rl || vu != vl) same_result = false;   // addresses must match
+                if (T_uni.last_fast_path()) uni_fast_seen = true;
+                if (T_leg.last_fast_path()) leg_fast_on_dead = true;
+            }
+        }
+        check(same_result,
+              "unified and legacy gates translate dead-bank addresses IDENTICALLY");
+        check(uni_fast_seen,
+              "unified gate: a dead-bank Bloom reject takes the FAST path");
+        check(!leg_fast_on_dead,
+              "legacy gate: every dead-bank access stays on the SLOW path");
+
+        // A dead bank whose relocated row DOES hit an A/B/C key must stay slow in
+        // both gates -- the Bloom cannot reject it, so real table work happens.
+        size_t uni_slow = 0;
+        for (int r = 0; r < 16384; ++r) {
+            AddrVec_t v = A(0,0,0,0,r,5);
+            T_uni.translate(v);
+            if (!T_uni.last_fast_path()) ++uni_slow;
+        }
+        check(uni_slow > 0,
+              "unified gate: dead-bank rows landing on A/B/C keys still go slow");
+    }
+
+    // -- Layer D -> A/B/C fall-through must be VISIBLE and charged SLOW --------
+    // The vacuum band is made of ordinary DRAM rows in live banks, so a relocated
+    // access can land on a row that is ITSELF faulty and needs A/B/C. translate()
+    // reports LAYER_D for those (D is the outermost layer), which would hide them
+    // in the per-layer counters -- hence last_layer_d_then_abc().
+    //
+    // This is NOT hypothetical: on the real worst die 193, 58 of its 1,990 A/B/C
+    // keys sit inside the vacuum band, and all 844 dead-bank dies have at least one.
+    {
+        RepairTranslator T2(t);
+        // dead1 rows 0/1/2 relocate onto rows that carry a B / C / A entry.
+        struct { AddrVec_t v; const char* what; } fall[] = {
+            { A(0,0,0,1, 0, 5), "D->B" },
+            { A(0,0,0,1, 1, 9), "D->C" },
+            { A(0,0,0,1, 2, 7), "D->A" },
+        };
+        bool all_flagged = true, all_slow = true;
+        for (auto& f : fall) {
+            AddrVec_t v = f.v;
+            RepairType r = T2.translate(v);
+            if (r != RepairType::LAYER_D)      all_flagged = false;
+            if (!T2.last_layer_d_then_abc())   all_flagged = false;
+            if (T2.last_fast_path())           all_slow = false;   // must be SLOW
+        }
+        check(all_flagged, "D->A/B/C fall-through is reported by last_layer_d_then_abc()");
+        check(all_slow,    "D->A/B/C fall-through is charged the SLOW path");
+
+        // A plain relocation (clean target row) must NOT be flagged, and under the
+        // unified gate it is allowed to take the fast path.
+        AddrVec_t v = A(0,0,0,1, 3, 5);        // relocates to a clean row
+        RepairType r = T2.translate(v);
+        check(r == RepairType::LAYER_D && !T2.last_layer_d_then_abc(),
+              "plain Layer D (clean target row) is NOT flagged as D->A/B/C");
+    }
 
     std::cout << "\n================ RESULT ================\n";
     std::cout << "  passed: " << g_pass << "   failed: " << g_fail << "\n";

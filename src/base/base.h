@@ -159,10 +159,26 @@ class Implementation {
     StatWrapper<T>& register_stat(std::vector<T>& val) { StatWrapper<T>* s = new StatWrapper<T>(val, *this, m_stats); return *s; };
     bool has_stats() { return !m_stats.is_empty(); };
     /**
-     * @brief    Recursively print the stats of myself and all my childs
-     * 
+     * @brief    Recursively zero the stats of myself and all my childs
+     *
+     * Scopes the statistics to a measurement window. gem5 calls this at the
+     * workload's ROI start (GAP workbegin) so that counters exclude graph
+     * loading and post-kernel verification. Stats marked no_reset() (clocks)
+     * survive; an implementation that derives an average from a clock should
+     * override this to snapshot that clock, and divide by the delta in
+     * finalize().
      */
-    virtual void print_stats(YAML::Emitter& emitter) { 
+    virtual void reset_stats() {
+      m_stats.reset();
+      for (auto child_impl : m_children) {
+        child_impl->reset_stats();
+      }
+    };
+    /**
+     * @brief    Recursively print the stats of myself and all my childs
+     *
+     */
+    virtual void print_stats(YAML::Emitter& emitter) {
       emitter << YAML::Key << get_ifce_name();
       emitter << YAML::Value;
       emitter << YAML::BeginMap;

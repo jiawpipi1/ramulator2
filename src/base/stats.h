@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <string>
+#include <type_traits>
 #include <variant>
 
 #include <spdlog/spdlog.h>
@@ -18,6 +19,21 @@ class Implementation;
 class StatWrapperBase {
   public:
     virtual void emit_to(YAML::Emitter& emitter) = 0;
+    /**
+     * @brief Zero this statistic to begin a new measurement window.
+     *
+     * Used to scope Ramulator's counters to a workload's region of interest
+     * (e.g. gem5's GAP workbegin), so that graph loading and result
+     * verification do not contaminate kernel numbers.
+     *
+     * A stat marked no_reset() is skipped. That escape hatch exists because
+     * some registered "stats" are really live simulation state -- notably the
+     * memory system's m_clk, which timestamps in-flight repair-lookup entries
+     * (req.arrive = m_clk; entries fire when ready <= m_clk). Zeroing it
+     * mid-run would strand every in-flight request at a ready time far in the
+     * future. Reset counters, never clocks.
+     */
+    virtual void reset() = 0;
 };
 
 template<typename T>
@@ -35,6 +51,12 @@ class Stats {
     bool is_empty() {
       return _registry.size() == 0;
     }
+
+    void reset() {
+      for (auto [stat_name, stat_ptr] : _registry) {
+        stat_ptr->reset();
+      }
+    }
 };
 
 
@@ -46,6 +68,7 @@ class StatWrapper : public StatWrapperBase {
     std::variant<T*, std::vector<T>*> _ref;
     std::string _name;
     std::string _desc;
+    bool _resettable = true;
 
     const Implementation& _impl;
     Stats& _stats;
@@ -53,6 +76,9 @@ class StatWrapper : public StatWrapperBase {
   public:
     StatWrapper(T& val, const Implementation& impl, Stats& stats) : _ref(&val), _impl(impl), _stats(stats) {};
     StatWrapper(std::vector<T>& val, const Implementation& impl, Stats& stats) : _ref(&val), _impl(impl), _stats(stats) {};
+
+    /// Exempt this stat from reset(). For live simulation state (clocks), not counters.
+    StatWrapper& no_reset() { _resettable = false; return *this; };
 
     StatWrapper& name(std::string name) { 
       _name = name; 
@@ -68,6 +94,23 @@ class StatWrapper : public StatWrapperBase {
     };
     
     StatWrapper& desc(std::string desc) { _desc = desc; return *this; };
+
+    void reset() override {
+      if (!_resettable) {
+        return;
+      }
+      // Only arithmetic stats have a meaningful zero. String stats (see
+      // example_impl) are descriptive and are left alone.
+      if constexpr (std::is_arithmetic_v<T>) {
+        if        (std::holds_alternative<T*>(_ref)) {
+          *(std::get<T*>(_ref)) = T{};
+        } else if (std::holds_alternative<std::vector<T>*>(_ref)) {
+          for (auto& _val : *(std::get<std::vector<T>*>(_ref))) {
+            _val = T{};
+          }
+        }
+      }
+    };
 
     void emit_to(YAML::Emitter& emitter) override {
       if        (std::holds_alternative<T*>(_ref)) {

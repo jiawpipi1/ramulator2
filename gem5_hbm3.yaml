@@ -40,11 +40,21 @@ MemorySystem:
     # Per-die repair table produced by repairv2 --dump-json.
     # Comment out for the fault-free baseline.
     repair_table_path: json/remap_hbm3_smoke.json
-    # The blocked Bloom reads all eight probes from one 64-bit word. Common
-    # live-bank rejects take the fast path; dead-bank requests and Bloom maybes
-    # take the slow D/A/B/C path. These are sensitivity assumptions, not bounds.
+    # The blocked Bloom reads all eight probes from one 64-bit word. There is ONE
+    # probe per request, on the post-Layer-D key. Bloom rejects take the fast
+    # path; Bloom maybes take the slow A/B/C path. These are sensitivity
+    # assumptions, not bounds.
     repair_fast_lookup_latency: 1
     repair_slow_lookup_latency: 12
+    # true : a Bloom reject is FAST even when Layer D relocated the request.
+    #        D is combinational (bank bitmap + address math) and reads no repair
+    #        table, so a relocated request with no A/B/C entry does no more table
+    #        work than a pass-through. Requires probing the Bloom with the post-D
+    #        key without serialising bitmap -> relocate -> Bloom: probe the
+    #        original and relocated keys in parallel and mux on the dead bit. The
+    #        filter is 2,992 B, so duplicating it (~6 KB) is cheap.
+    # false: legacy/conservative -- every dead-bank access pays the slow latency.
+    repair_unified_gate: true
     layer_a_data_latency: 6    # logic-die SRAM data access; Layer A bypasses DRAM
     repair_pipeline_size: 64   # bounded pre-controller lookup/SRAM pipeline
     plugins:

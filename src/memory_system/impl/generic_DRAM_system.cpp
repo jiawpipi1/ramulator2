@@ -37,15 +37,24 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
     std::vector<size_t> s_repair_layer_c, s_repair_layer_d;
     std::vector<size_t> s_bloom_reject, s_bloom_maybe;
     std::vector<size_t> s_lookup_fast, s_lookup_slow;
+    // Layer D returns LAYER_D even when the relocated row ALSO needed A/B/C
+    // (the vacuum band is made of ordinary DRAM rows, which can themselves be
+    // faulty). Split the two so the per-layer counters cannot hide that case.
+    std::vector<size_t> s_repair_d_only, s_repair_d_then_abc;
 
   public:
     int s_num_read_requests = 0;
     int s_num_write_requests = 0;
     int s_num_other_requests = 0;
+    // Cycles elapsed inside the current measurement window. m_clk itself cannot
+    // be reset (it timestamps in-flight repair-lookup entries), so the ROI
+    // window is reported separately and derived in finalize().
+    Clk_t s_roi_cycles = 0;
+    Clk_t m_stats_reset_clk = 0;
 
 
   public:
-    void init() override { 
+    void init() override {
       // Create device (a top-level node wrapping all channel nodes)
       m_dram = create_child_ifce<IDRAM>();
       m_addr_mapper = create_child_ifce<IAddrMapper>();
@@ -94,7 +103,19 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
         if (controller_cfg["repair_debug_addr"] &&
             controller_cfg["repair_debug_addr"].as<bool>())
           g_debug_address.store(true, std::memory_order_relaxed);
-        m_repair_translator = std::make_unique<RepairTranslator>(m_repair_table, bloom);
+        // Unified front gate: a Bloom reject is fast even when Layer D relocated
+        // the request, because D touches no repair table (bitmap + combinational
+        // address math). Set false to charge every dead-bank access the slow
+        // latency -- the conservative bracket, and what the old code did.
+        const bool unified_gate = controller_cfg["repair_unified_gate"]
+                                ? controller_cfg["repair_unified_gate"].as<bool>() : true;
+        // 512-bit blocks; 16 bits/key measures 0.182% FP on worst die 193.
+        const int bloom_bits_per_key = controller_cfg["repair_bloom_bits_per_key"]
+                                     ? controller_cfg["repair_bloom_bits_per_key"].as<int>() : 16;
+        const int bloom_k = controller_cfg["repair_bloom_probes"]
+                          ? controller_cfg["repair_bloom_probes"].as<int>() : 8;
+        m_repair_translator = std::make_unique<RepairTranslator>(
+            m_repair_table, bloom, bloom_bits_per_key, bloom_k, unified_gate);
       }
 
       // Create memory controllers
@@ -107,7 +128,14 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
 
       m_clock_ratio = param<uint>("clock_ratio").required();
 
-      register_stat(m_clk).name("memory_system_cycles");
+      // m_clk is live simulation state, not a counter: the repair-lookup
+      // pipeline stamps entries with `ready = m_clk + latency` and fires them
+      // when `ready <= m_clk`. Zeroing it at an ROI boundary would strand every
+      // in-flight request. It stays process-cumulative; s_roi_cycles reports
+      // the measurement window instead.
+      register_stat(m_clk).name("memory_system_cycles").no_reset();
+      register_stat(s_roi_cycles).name("roi_cycles")
+          .desc("memory-system cycles since the last stats reset (ROI window)");
       register_stat(s_num_read_requests).name("total_num_read_requests");
       register_stat(s_num_write_requests).name("total_num_write_requests");
       register_stat(s_num_other_requests).name("total_num_other_requests");
@@ -116,7 +144,10 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
       s_repair_layer_d.resize(num_channels); s_bloom_reject.resize(num_channels);
       s_bloom_maybe.resize(num_channels); s_lookup_fast.resize(num_channels);
       s_lookup_slow.resize(num_channels);
+      s_repair_d_only.resize(num_channels); s_repair_d_then_abc.resize(num_channels);
       for (int ch = 0; ch < num_channels; ++ch) {
+        register_stat(s_repair_d_only[ch]).name("repair_layer_d_only_{}", ch);
+        register_stat(s_repair_d_then_abc[ch]).name("repair_layer_d_then_abc_{}", ch);
         register_stat(s_repair_none[ch]).name("repair_none_{}", ch);
         register_stat(s_repair_layer_a[ch]).name("repair_layer_a_{}", ch);
         register_stat(s_repair_layer_b[ch]).name("repair_layer_b_{}", ch);
@@ -131,6 +162,23 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
 
     void setup(IFrontEnd* frontend, IMemorySystem* memory_system) override { }
 
+    // Begin a new measurement window (gem5 calls this at GAP workbegin). The
+    // base zeroes every resettable stat here and in every child (controllers,
+    // row policies, ...); we additionally snapshot the clock so finalize() can
+    // report the window length. m_clk is deliberately NOT zeroed -- see init().
+    void reset_stats() override {
+      Implementation::reset_stats();
+      m_stats_reset_clk = m_clk;
+    }
+
+    // Overrides IMemorySystem::finalize (and, harmlessly, the Implementation
+    // one -- both have this signature). Derive the ROI window, then let the
+    // base finalize the children and emit the YAML stats block.
+    void finalize() override {
+      s_roi_cycles = m_clk - m_stats_reset_clk;
+      IMemorySystem::finalize();
+    }
+
 
     bool send(Request req) override {
       m_addr_mapper->apply(req);
@@ -138,11 +186,13 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
       bool layer_a_sram = false;
       bool bloom_reject = false;
       bool lookup_fast = false;
+      bool d_then_abc = false;
       if (m_repair_translator) {
         repair_type = m_repair_translator->translate(req.addr_vec, req.addr);
         layer_a_sram = m_repair_translator->last_uses_layer_a_sram();
         bloom_reject = m_repair_translator->last_bloom_reject();
         lookup_fast = m_repair_translator->last_fast_path();
+        d_then_abc = m_repair_translator->last_layer_d_then_abc();
       }
       int channel_id = req.addr_vec[0];  // route AFTER repair translation
       const int lookup_latency = lookup_fast
@@ -183,7 +233,15 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
             case RepairType::LAYER_A: ++s_repair_layer_a[channel_id]; break;
             case RepairType::LAYER_B: ++s_repair_layer_b[channel_id]; break;
             case RepairType::LAYER_C: ++s_repair_layer_c[channel_id]; break;
-            case RepairType::LAYER_D: ++s_repair_layer_d[channel_id]; break;
+            case RepairType::LAYER_D: {
+              ++s_repair_layer_d[channel_id];
+              // A Layer-D request may ALSO have needed A/B/C on its relocated
+              // row. translate() reports it as LAYER_D (D is the outermost
+              // layer), so split it out here or the case stays invisible.
+              if (d_then_abc) ++s_repair_d_then_abc[channel_id];
+              else            ++s_repair_d_only[channel_id];
+              break;
+            }
           }
           if (m_repair_translator->bloom_enabled()) {
             if (bloom_reject) ++s_bloom_reject[channel_id];

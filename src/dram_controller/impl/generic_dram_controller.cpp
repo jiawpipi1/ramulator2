@@ -16,6 +16,9 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
 
     int m_bank_addr_idx = -1;
 
+    // Clock value when the current statistics window opened (see reset_stats).
+    Clk_t m_stats_reset_clk = 0;
+
     float m_wr_low_watermark;
     float m_wr_high_watermark;
     bool  m_is_write_mode = false;
@@ -403,13 +406,27 @@ class GenericDRAMController final : public IDRAMController, public Implementatio
       return request_found;
     }
 
-    void finalize() override {
-      s_avg_read_latency = (float) s_read_latency / (float) s_num_read_reqs;
+    // Begin a new measurement window. The base zeroes the registered counters;
+    // m_clk is live state (it stamps req.depart), so instead of zeroing it we
+    // remember where the window started and divide by the delta in finalize().
+    // Without this, an ROI-scoped numerator would be divided by a
+    // whole-process denominator and every queue-occupancy average would be
+    // silently understated.
+    void reset_stats() override {
+      Implementation::reset_stats();
+      m_stats_reset_clk = m_clk;
+    }
 
-      s_queue_len_avg = (float) s_queue_len / (float) m_clk;
-      s_read_queue_len_avg = (float) s_read_queue_len / (float) m_clk;
-      s_write_queue_len_avg = (float) s_write_queue_len / (float) m_clk;
-      s_priority_queue_len_avg = (float) s_priority_queue_len / (float) m_clk;
+    void finalize() override {
+      s_avg_read_latency = s_num_read_reqs
+          ? (float) s_read_latency / (float) s_num_read_reqs : 0.0f;
+
+      const Clk_t window = (m_clk > m_stats_reset_clk)
+          ? (m_clk - m_stats_reset_clk) : 1;
+      s_queue_len_avg = (float) s_queue_len / (float) window;
+      s_read_queue_len_avg = (float) s_read_queue_len / (float) window;
+      s_write_queue_len_avg = (float) s_write_queue_len / (float) window;
+      s_priority_queue_len_avg = (float) s_priority_queue_len / (float) window;
 
       return;
     }
