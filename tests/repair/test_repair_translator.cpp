@@ -176,9 +176,11 @@ int main() {
     { AddrVec_t v=A(1,0,0,3,512,5); T.translate(v); check(!T.last_bloom_reject(), "A key -> bloom maybe (not screened)"); }
     { AddrVec_t v=A(1,0,0,3,800,5); T.translate(v); check(!T.last_bloom_reject(), "B key -> bloom maybe"); }
     { AddrVec_t v=A(1,0,0,3,900,8); T.translate(v); check(!T.last_bloom_reject(), "C key -> bloom maybe"); }
+    { AddrVec_t v=A(1,0,0,3,512,5); T.translate(v); check(!T.last_fast_path(), "A key -> slow lookup path"); }
+    { AddrVec_t v=A(0,0,0,0,123,5); T.translate(v); check(!T.last_fast_path(), "dead bank -> slow lookup path"); }
     // Clean rows should mostly take the fast (reject) path -> that is the power win.
-    { size_t rej=0,tot=0; for (int r=0;r<2000;++r){ AddrVec_t v=A(6,0,0,2,r,1); T.translate(v); ++tot; if(T.last_bloom_reject())++rej; }
-      check(rej > tot*9/10, "clean addrs mostly bloom-rejected (fast path >90%)"); }
+    { size_t fast=0,tot=0; for (int r=0;r<2000;++r){ AddrVec_t v=A(6,0,0,2,r,1); T.translate(v); ++tot; if(T.last_fast_path())++fast; }
+      check(fast > tot*9/10, "clean addrs mostly bloom-rejected (fast path >90%)"); }
 
     std::cout << "\n================ RESULT ================\n";
     std::cout << "  passed: " << g_pass << "   failed: " << g_fail << "\n";

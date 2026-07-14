@@ -1,6 +1,11 @@
 build/
+build_new/
+build_asan/
+build_gem5/
+build_debug/
 .vscode
 ext/
+results/
 ramulator2
 *.so
 autobuild.sh

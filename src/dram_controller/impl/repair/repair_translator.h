@@ -3,9 +3,12 @@
 // Address translation through the 4-layer HBM repair hierarchy.
 //
 // Layer priority / flow for one request:
+//   Front gate          : check the tiny dead-bank membership structure and the
+//                         A/B/C Bloom filter together. A live-bank Bloom reject
+//                         is the common fast path and returns immediately.
 //   Layer D (dead bank) : RELOCATE the access to a live bank's reserved top-row
-//                         band, then FALL THROUGH to A/B/C on the relocated
-//                         address (the target top row may itself be faulty).
+//                         band, then re-check Bloom and FALL THROUGH to A/B/C on
+//                         the relocated address (the target row may be faulty).
 //   Layer A (SRAM)      : overflow row -> SRAM replacement row.
 //   Layer B (DED)       : faulty row   -> dedicated whole-row spare.
 //   Layer C (burst)     : faulty col range -> burst spare slot.
@@ -44,35 +47,38 @@
 
 namespace Ramulator {
 
-// -- Bloom filter --------------------------------------------------------
+// -- Blocked Bloom filter ------------------------------------------------
 // Screens the fine-grained (bank,row) A/B/C repair keys. Remapping is sparse
 // (almost every request is a pass-through), so a request whose (bank,row) is
 // "definitely not" in the repair set can skip all the A/B/C table lookups --
 // saving lookup energy. No false negatives: a real A/B/C key always tests
 // "maybe present", so translation stays exact. False positives just fall back
-// to the full (correct) lookup.
+// to the full (correct) lookup. All k probes for one key occupy one 64-bit word,
+// so hardware needs one small-SRAM read rather than k random reads/ports.
 class BloomFilter {
 public:
     void build(size_t n_keys, int bits_per_key, int k) {
         m_k = (k > 0) ? k : 1;
         size_t nbits = (n_keys ? n_keys : 1) * (size_t)(bits_per_key > 0 ? bits_per_key : 12);
         if (nbits < 1024) nbits = 1024;
-        m_nbits = nbits;
-        m_bits.assign(m_nbits, false);
+        m_words.assign((nbits + 63) / 64, 0);
+        m_nbits = m_words.size() * 64;
     }
     bool built() const { return m_nbits > 0; }
     void insert(uint64_t key) {
-        uint64_t h1, h2; hashes(key, h1, h2);
-        for (int i = 0; i < m_k; ++i) m_bits[(h1 + (uint64_t)i * h2) % m_nbits] = true;
+        size_t word;
+        uint64_t mask;
+        location(key, word, mask);
+        m_words[word] |= mask;
     }
     // true  => key MIGHT be present (do the full lookup)
     // false => key is DEFINITELY absent (safe to skip A/B/C)
     bool maybe_contains(uint64_t key) const {
         if (!built()) return true;               // disabled -> never screens
-        uint64_t h1, h2; hashes(key, h1, h2);
-        for (int i = 0; i < m_k; ++i)
-            if (!m_bits[(h1 + (uint64_t)i * h2) % m_nbits]) return false;
-        return true;
+        size_t word;
+        uint64_t mask;
+        location(key, word, mask);
+        return (m_words[word] & mask) == mask;
     }
     size_t num_bits() const { return m_nbits; }
     int    num_hashes() const { return m_k; }
@@ -81,11 +87,15 @@ private:
         x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
         x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33; return x;
     }
-    void hashes(uint64_t key, uint64_t& h1, uint64_t& h2) const {
-        h1 = mix(key);
-        h2 = mix(key ^ 0x9e3779b97f4a7c15ULL) | 1ULL;   // odd, so coprime with m
+    void location(uint64_t key, size_t& word, uint64_t& mask) const {
+        word = mix(key ^ 0x243f6a8885a308d3ULL) % m_words.size();
+        uint64_t first = mix(key ^ 0x9e3779b97f4a7c15ULL);
+        uint64_t step = mix(key ^ 0xc2b2ae3d27d4eb4fULL) | 1ULL;
+        mask = 0;
+        for (int i = 0; i < m_k; ++i)
+            mask |= 1ULL << ((first + (uint64_t)i * step) & 63ULL);
     }
-    std::vector<bool> m_bits;
+    std::vector<uint64_t> m_words;
     size_t m_nbits = 0;
     int    m_k = 0;
 };
@@ -141,6 +151,7 @@ public:
     size_t bloom_rejects()   const { return m_bloom_reject; }   // fast path taken
     size_t bloom_maybes()    const { return m_bloom_maybe;  }   // full A/B/C lookup done
     bool   last_bloom_reject() const { return m_last_reject; }  // for the most recent translate()
+    bool   last_fast_path() const { return m_last_fast; }       // live bank + Bloom reject
     bool   last_uses_layer_a_sram() const { return m_last_layer_a; }
 
     RepairType translate(AddrVec_t& av, Addr_t raw_addr = 0) const {
@@ -163,11 +174,34 @@ public:
                 << " ba=" << ba << " row=" << row << " col=" << col << "\n";
         }
 
+        m_last_reject = false;
+        m_last_fast = false;
+        const BankKey4 source_bank{ch, pch, bg, ba};
+        const bool source_dead = m_tbl.bad_bank_set.count(source_bank) != 0;
+
+        // -- Common front gate ------------------------------------------------
+        // In hardware, source_dead is a tiny bank bitmap/CAM check that can run
+        // beside the Bloom probes. A live-bank Bloom reject proves that neither
+        // D nor A/B/C can apply, so the request returns without exercising the
+        // relocation or full tables. A dead-bank request cannot use this reject:
+        // D changes its bank/row, and the translated key must be checked again.
+        if (m_bloom_enabled && !source_dead) {
+            if (!m_bloom.maybe_contains(bank_row_key(ch, pch, bg, ba, row))) {
+                ++m_bloom_reject;
+                m_last_reject = true;
+                m_last_fast = true;
+                if (dbg) std::cerr << "  [Front gate] live bank + Bloom reject"
+                                   << " -> fast pass-through\n";
+                return RepairType::NONE;
+            }
+            ++m_bloom_maybe;
+        }
+
         RepairType d_result = RepairType::NONE;
 
         // -- Layer D: dead bank -> relocate to a live bank's reserved band -----
-        if (m_tbl.bad_bank_set.count(std::make_tuple(ch, pch, bg, ba))) {
-            auto it = m_dead_ordinal.find(std::make_tuple(ch, pch, bg, ba));
+        if (source_dead) {
+            auto it = m_dead_ordinal.find(source_bank);
             bool ok = (it != m_dead_ordinal.end()) && m_num_live > 0 && m_band_h > 0;
             int j = ok ? (row / m_band_h) : -1;
             if (ok && j < m_num_live) {
@@ -199,9 +233,10 @@ public:
             }
         }
 
-        // -- Bloom pre-filter: skip A/B/C when (bank,row) is definitely absent -
-        m_last_reject = false;
-        if (m_bloom_enabled) {
+        // A live-bank Bloom maybe was already counted by the front gate. For a
+        // dead source bank, query the relocated key now; querying only the
+        // original key would introduce false negatives after Layer D.
+        if (m_bloom_enabled && source_dead) {
             if (!m_bloom.maybe_contains(bank_row_key(ch, pch, bg, ba, row))) {
                 ++m_bloom_reject;
                 m_last_reject = true;
@@ -325,6 +360,7 @@ private:
     mutable size_t m_bloom_reject = 0;
     mutable size_t m_bloom_maybe  = 0;
     mutable bool   m_last_reject  = false;
+    mutable bool   m_last_fast    = false;
     mutable bool   m_last_layer_a = false;
 };
 

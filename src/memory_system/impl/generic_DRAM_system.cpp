@@ -29,12 +29,14 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
       bool layer_a_sram;
     };
     std::deque<PendingRepair> m_repair_pipeline;
-    int m_repair_lookup_latency = 0;
+    int m_repair_fast_lookup_latency = 0;
+    int m_repair_slow_lookup_latency = 0;
     int m_layer_a_data_latency = 6;
     size_t m_repair_pipeline_size = 64;
     std::vector<size_t> s_repair_none, s_repair_layer_a, s_repair_layer_b;
     std::vector<size_t> s_repair_layer_c, s_repair_layer_d;
     std::vector<size_t> s_bloom_reject, s_bloom_maybe;
+    std::vector<size_t> s_lookup_fast, s_lookup_slow;
 
   public:
     int s_num_read_requests = 0;
@@ -68,15 +70,27 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
               "Repair-table geometry does not match the DRAM organization");
         bool bloom = controller_cfg["repair_enable_bloom"]
                    ? controller_cfg["repair_enable_bloom"].as<bool>() : true;
-        m_repair_lookup_latency = controller_cfg["repair_lookup_latency"]
-                                ? controller_cfg["repair_lookup_latency"].as<int>() : 0;
+        // Split latency models the common live-bank Bloom-reject path separately
+        // from dead-bank, Bloom-maybe, and Bloom-disabled lookups. Preserve the
+        // old single field as a backward-compatible fixed-latency configuration.
+        const int legacy_lookup_latency = controller_cfg["repair_lookup_latency"]
+                                        ? controller_cfg["repair_lookup_latency"].as<int>() : 0;
+        m_repair_fast_lookup_latency = controller_cfg["repair_fast_lookup_latency"]
+                                     ? controller_cfg["repair_fast_lookup_latency"].as<int>()
+                                     : legacy_lookup_latency;
+        m_repair_slow_lookup_latency = controller_cfg["repair_slow_lookup_latency"]
+                                     ? controller_cfg["repair_slow_lookup_latency"].as<int>()
+                                     : legacy_lookup_latency;
         m_layer_a_data_latency = controller_cfg["layer_a_data_latency"]
                                ? controller_cfg["layer_a_data_latency"].as<int>() : 6;
         m_repair_pipeline_size = controller_cfg["repair_pipeline_size"]
                                ? controller_cfg["repair_pipeline_size"].as<size_t>() : 64;
-        if (m_repair_lookup_latency < 0 || m_layer_a_data_latency < 0 ||
+        if (m_repair_fast_lookup_latency < 0 ||
+            m_repair_slow_lookup_latency < m_repair_fast_lookup_latency ||
+            m_layer_a_data_latency < 0 ||
             m_repair_pipeline_size == 0)
-          throw std::runtime_error("repair latencies must be non-negative and pipeline size positive");
+          throw std::runtime_error(
+              "repair latencies must satisfy 0 <= fast <= slow and pipeline size must be positive");
         if (controller_cfg["repair_debug_addr"] &&
             controller_cfg["repair_debug_addr"].as<bool>())
           g_debug_address.store(true, std::memory_order_relaxed);
@@ -100,7 +114,8 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
       s_repair_none.resize(num_channels); s_repair_layer_a.resize(num_channels);
       s_repair_layer_b.resize(num_channels); s_repair_layer_c.resize(num_channels);
       s_repair_layer_d.resize(num_channels); s_bloom_reject.resize(num_channels);
-      s_bloom_maybe.resize(num_channels);
+      s_bloom_maybe.resize(num_channels); s_lookup_fast.resize(num_channels);
+      s_lookup_slow.resize(num_channels);
       for (int ch = 0; ch < num_channels; ++ch) {
         register_stat(s_repair_none[ch]).name("repair_none_{}", ch);
         register_stat(s_repair_layer_a[ch]).name("repair_layer_a_{}", ch);
@@ -109,6 +124,8 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
         register_stat(s_repair_layer_d[ch]).name("repair_layer_d_{}", ch);
         register_stat(s_bloom_reject[ch]).name("bloom_reject_{}", ch);
         register_stat(s_bloom_maybe[ch]).name("bloom_maybe_{}", ch);
+        register_stat(s_lookup_fast[ch]).name("repair_lookup_fast_{}", ch);
+        register_stat(s_lookup_slow[ch]).name("repair_lookup_slow_{}", ch);
       }
     };
 
@@ -120,19 +137,24 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
       RepairType repair_type = RepairType::NONE;
       bool layer_a_sram = false;
       bool bloom_reject = false;
+      bool lookup_fast = false;
       if (m_repair_translator) {
         repair_type = m_repair_translator->translate(req.addr_vec, req.addr);
         layer_a_sram = m_repair_translator->last_uses_layer_a_sram();
         bloom_reject = m_repair_translator->last_bloom_reject();
+        lookup_fast = m_repair_translator->last_fast_path();
       }
       int channel_id = req.addr_vec[0];  // route AFTER repair translation
+      const int lookup_latency = lookup_fast
+                               ? m_repair_fast_lookup_latency
+                               : m_repair_slow_lookup_latency;
       bool needs_pipeline = m_repair_translator &&
-                            (m_repair_lookup_latency > 0 || layer_a_sram);
+                            (lookup_latency > 0 || layer_a_sram);
       bool is_success = false;
       if (needs_pipeline) {
         if (m_repair_pipeline.size() >= m_repair_pipeline_size) return false;
         req.arrive = m_clk;
-        Clk_t ready = m_clk + m_repair_lookup_latency +
+        Clk_t ready = m_clk + lookup_latency +
                       (layer_a_sram ? m_layer_a_data_latency : 0);
         m_repair_pipeline.push_back({ready, req, layer_a_sram});
         is_success = true;
@@ -167,6 +189,8 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
             if (bloom_reject) ++s_bloom_reject[channel_id];
             else              ++s_bloom_maybe[channel_id];
           }
+          if (lookup_fast) ++s_lookup_fast[channel_id];
+          else             ++s_lookup_slow[channel_id];
         }
       }
 
@@ -225,4 +249,3 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
 };
   
 }   // namespace 
-
