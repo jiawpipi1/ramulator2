@@ -177,6 +177,14 @@ int main() {
     { AddrVec_t v=A(1,0,0,3,800,5); T.translate(v); check(!T.last_bloom_reject(), "B key -> bloom maybe"); }
     { AddrVec_t v=A(1,0,0,3,900,8); T.translate(v); check(!T.last_bloom_reject(), "C key -> bloom maybe"); }
     { AddrVec_t v=A(1,0,0,3,512,5); T.translate(v); check(!T.last_fast_path(), "A key -> slow lookup path"); }
+    { AddrVec_t v=A(1,0,0,3,512,5); T.translate(v);
+      check(!T.last_source_bank_dead() && T.last_abc_table_lookup(),
+            "live A hit reports exact-table activity without Layer D"); }
+    { AddrVec_t v=A(6,0,0,2,123,1); T.translate(v);
+      check(!T.last_source_bank_dead() && !T.last_abc_table_lookup(),
+            "Bloom reject reports no exact-table activity"); }
+    { AddrVec_t v=A(0,0,0,0,3,5); T.translate(v);
+      check(T.last_source_bank_dead(), "dead source reports Layer-D metadata activity"); }
     // Clean rows should mostly take the fast (reject) path -> that is the power win.
     { size_t fast=0,tot=0; for (int r=0;r<2000;++r){ AddrVec_t v=A(6,0,0,2,r,1); T.translate(v); ++tot; if(T.last_fast_path())++fast; }
       check(fast > tot*9/10, "clean addrs mostly bloom-rejected (fast path >90%)"); }

@@ -1,5 +1,5 @@
 // Validate every production repair table in a directory with the runtime loader.
-// Usage: validate_repair_directory DIR EXPECTED_COUNT EXPECTED_CHANNELS
+// Usage: validate_repair_directory DIR EXPECTED_COUNT EXPECTED_CHANNELS [EXPECTED_SLOTS]
 
 #include <filesystem>
 #include <iostream>
@@ -12,14 +12,15 @@ namespace fs = std::filesystem;
 using Ramulator::HbmRepairTable;
 
 int main(int argc, char** argv) {
-  if (argc != 4) {
+  if (argc != 4 && argc != 5) {
     std::cerr << "usage: " << argv[0]
-              << " DIR EXPECTED_COUNT EXPECTED_CHANNELS\n";
+              << " DIR EXPECTED_COUNT EXPECTED_CHANNELS [EXPECTED_SLOTS]\n";
     return 2;
   }
   const fs::path directory = argv[1];
   const int expected_count = std::stoi(argv[2]);
   const int expected_channels = std::stoi(argv[3]);
+  const int expected_slots = argc == 5 ? std::stoi(argv[4]) : 16;
   if (!fs::is_directory(directory)) {
     std::cerr << "not a directory: " << directory << "\n";
     return 2;
@@ -37,7 +38,7 @@ int main(int argc, char** argv) {
     }
     if (table.cfg.num_channels != expected_channels ||
         table.cfg.rows_per_bank != 16384 || table.cfg.bursts_per_row != 32 ||
-        table.cfg.vacuum_limit != 512 || table.cfg.sram_slots != 16 ||
+        table.cfg.vacuum_limit != 512 || table.cfg.sram_slots != expected_slots ||
         table.cfg.total_spare_rows != 4) {
       std::cerr << "unexpected config in: " << entry.path() << "\n";
       return 1;

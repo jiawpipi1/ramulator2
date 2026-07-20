@@ -68,7 +68,7 @@ public:
     //   block   bits/key  k   size     measured FP   (worst die 193, 1,972 keys)
     //     64       12     8   2,960 B     2.178%     <- the old configuration
     //    512       12     8   3,008 B     0.517%
-    //    512       16     8   3,968 B     0.182%     <- current
+    //    512       16     8   4,032 B     0.1747%    <- current runtime
     //   (textbook non-blocked, m/n=12, k=8:  0.31%)
     //
     // WHY: keys land in blocks by a hash, so occupancy is Poisson-spread. The
@@ -165,8 +165,9 @@ inline const char* repair_type_name(RepairType t) {
 
 class RepairTranslator {
 public:
-    // 16 bits/key with 512-bit blocks measures 0.182% FP on worst die 193
-    // (3,968 B). See BloomFilter for why the block size, not the bit budget, was
+    // Conservative repair-entry sizing with 512-bit blocks measures 0.1747% FP
+    // on worst die 193 (4,032 B, 300k live-bank negative probes). See
+    // BloomFilter for why the block size, not the bit budget, was
     // the thing that mattered.
     explicit RepairTranslator(const HbmRepairTable& tbl, bool enable_bloom = true,
                               int bloom_bits_per_key = 16, int bloom_k = 8,
@@ -193,6 +194,12 @@ public:
     bool   last_bloom_reject() const { return m_last_reject; }  // for the most recent translate()
     bool   last_fast_path() const { return m_last_fast; }       // live bank + Bloom reject
     bool   last_uses_layer_a_sram() const { return m_last_layer_a; }
+    // Array-activity flags for the most recent translate().  These describe
+    // logical metadata accesses, independent of the configured latency model.
+    // The memory-system counts them only after the request is accepted, so a
+    // backpressured retry cannot inflate workload energy.
+    bool   last_source_bank_dead() const { return m_last_source_dead; }
+    bool   last_abc_table_lookup() const { return m_last_abc_lookup; }
     // True when the request was relocated by Layer D AND the relocated row then
     // ALSO needed an A/B/C repair. The vacuum band is made of ordinary DRAM rows
     // in live banks, so a relocated access can land on a row that is itself
@@ -204,6 +211,8 @@ public:
     RepairType translate(AddrVec_t& av, Addr_t raw_addr = 0) const {
         m_last_layer_a = false;
         m_last_d_abc = false;
+        m_last_source_dead = false;
+        m_last_abc_lookup = false;
         int ch  = av[AIDX_CH];
         int pch = av[AIDX_PCH];
         int bg  = av[AIDX_BG];
@@ -226,6 +235,7 @@ public:
         m_last_fast = false;
         const BankKey4 source_bank{ch, pch, bg, ba};
         const bool source_dead = m_tbl.bad_bank_set.count(source_bank) != 0;
+        m_last_source_dead = source_dead;
 
         // -- Front gate: exact dead-bank membership ---------------------------
         // source_dead is a 512-bit bank bitmap (64 B for HBM3): one bit indexed
@@ -294,8 +304,9 @@ public:
         // The hardware assumption this buys: to keep the fast path at one cycle,
         // the Bloom must be probed with the post-D key without serialising
         // bitmap -> relocate -> Bloom. Probe BOTH the original and the relocated
-        // key in parallel and let the dead bit mux the result; the blocked filter
-        // is only 2,992 B, so duplicating it (~6 KB) or dual-porting it is cheap.
+        // key in parallel and let the dead bit mux the result. The non-RTL power
+        // model therefore reports two Bloom copies for F1; one copy is only the
+        // serialized area lower bound.
         // Set m_unified_gate = false to charge dead banks the slow latency and
         // measure the conservative bracket.
         if (m_bloom_enabled) {
@@ -311,6 +322,10 @@ public:
             }
             ++m_bloom_maybe;                      // fall through to full lookup
         }
+
+        // A Bloom maybe (or Bloom disabled) performs the packed A/B/C metadata
+        // lookup.  This is one logical table access even if all three maps miss.
+        m_last_abc_lookup = true;
 
         // -- Layer A: SRAM overflow row ---------------------------------------
         {
@@ -401,6 +416,11 @@ private:
     // Insert every fine-grained A/B/C (bank,row) repair key. Layer D is NOT
     // inserted -- it is a coarse per-bank check against bad_bank_set.
     void build_bloom(int bits_per_key, int k) {
+        // Capacity is conservatively based on repair entries. Several Layer-C
+        // segments can share one tested (bank,row) key, so this can allocate a
+        // few more bits than unique-key sizing; the CACTI capacity model uses
+        // the same rule. Preserve it because the published Claim-2 matrix used
+        // this organization.
         size_t n = m_tbl.sram_full_map.size() + m_tbl.ded_row_map.size()
                  + m_tbl.burst_map.size();
         m_bloom.build(n, bits_per_key, k);
@@ -434,6 +454,8 @@ private:
     mutable bool   m_last_fast    = false;
     mutable bool   m_last_layer_a = false;
     mutable bool   m_last_d_abc   = false;
+    mutable bool   m_last_source_dead = false;
+    mutable bool   m_last_abc_lookup = false;
 };
 
 } // namespace Ramulator

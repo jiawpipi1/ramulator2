@@ -41,6 +41,13 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
     // (the vacuum band is made of ordinary DRAM rows, which can themselves be
     // faulty). Split the two so the per-layer counters cannot hide that case.
     std::vector<size_t> s_repair_d_only, s_repair_d_then_abc;
+    // Accepted-request array activity for workload-dependent CACTI energy.
+    // These are logical accesses; physical replication factors are applied by
+    // the post-processing model rather than hidden in simulator counters.
+    std::vector<size_t> s_meta_dead_bitmap_read, s_meta_bloom_probe;
+    std::vector<size_t> s_meta_abc_read, s_meta_d_ordinal_read;
+    std::vector<size_t> s_meta_d_live_list_read;
+    std::vector<size_t> s_layer_a_data_read, s_layer_a_data_write;
 
   public:
     int s_num_read_requests = 0;
@@ -109,7 +116,8 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
         // latency -- the conservative bracket, and what the old code did.
         const bool unified_gate = controller_cfg["repair_unified_gate"]
                                 ? controller_cfg["repair_unified_gate"].as<bool>() : true;
-        // 512-bit blocks; 16 bits/key measures 0.182% FP on worst die 193.
+        // 512-bit blocks; conservative entry sizing measures 0.1747% FP on
+        // worst die 193 (300k live-bank negative probes).
         const int bloom_bits_per_key = controller_cfg["repair_bloom_bits_per_key"]
                                      ? controller_cfg["repair_bloom_bits_per_key"].as<int>() : 16;
         const int bloom_k = controller_cfg["repair_bloom_probes"]
@@ -145,6 +153,11 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
       s_bloom_maybe.resize(num_channels); s_lookup_fast.resize(num_channels);
       s_lookup_slow.resize(num_channels);
       s_repair_d_only.resize(num_channels); s_repair_d_then_abc.resize(num_channels);
+      s_meta_dead_bitmap_read.resize(num_channels);
+      s_meta_bloom_probe.resize(num_channels); s_meta_abc_read.resize(num_channels);
+      s_meta_d_ordinal_read.resize(num_channels);
+      s_meta_d_live_list_read.resize(num_channels);
+      s_layer_a_data_read.resize(num_channels); s_layer_a_data_write.resize(num_channels);
       for (int ch = 0; ch < num_channels; ++ch) {
         register_stat(s_repair_d_only[ch]).name("repair_layer_d_only_{}", ch);
         register_stat(s_repair_d_then_abc[ch]).name("repair_layer_d_then_abc_{}", ch);
@@ -157,6 +170,13 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
         register_stat(s_bloom_maybe[ch]).name("bloom_maybe_{}", ch);
         register_stat(s_lookup_fast[ch]).name("repair_lookup_fast_{}", ch);
         register_stat(s_lookup_slow[ch]).name("repair_lookup_slow_{}", ch);
+        register_stat(s_meta_dead_bitmap_read[ch]).name("metadata_dead_bitmap_read_{}", ch);
+        register_stat(s_meta_bloom_probe[ch]).name("metadata_bloom_probe_{}", ch);
+        register_stat(s_meta_abc_read[ch]).name("metadata_abc_read_{}", ch);
+        register_stat(s_meta_d_ordinal_read[ch]).name("metadata_layer_d_ordinal_read_{}", ch);
+        register_stat(s_meta_d_live_list_read[ch]).name("metadata_layer_d_live_list_read_{}", ch);
+        register_stat(s_layer_a_data_read[ch]).name("layer_a_data_read_{}", ch);
+        register_stat(s_layer_a_data_write[ch]).name("layer_a_data_write_{}", ch);
       }
     };
 
@@ -187,12 +207,16 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
       bool bloom_reject = false;
       bool lookup_fast = false;
       bool d_then_abc = false;
+      bool source_dead = false;
+      bool abc_lookup = false;
       if (m_repair_translator) {
         repair_type = m_repair_translator->translate(req.addr_vec, req.addr);
         layer_a_sram = m_repair_translator->last_uses_layer_a_sram();
         bloom_reject = m_repair_translator->last_bloom_reject();
         lookup_fast = m_repair_translator->last_fast_path();
         d_then_abc = m_repair_translator->last_layer_d_then_abc();
+        source_dead = m_repair_translator->last_source_bank_dead();
+        abc_lookup = m_repair_translator->last_abc_table_lookup();
       }
       int channel_id = req.addr_vec[0];  // route AFTER repair translation
       const int lookup_latency = lookup_fast
@@ -246,6 +270,21 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
           if (m_repair_translator->bloom_enabled()) {
             if (bloom_reject) ++s_bloom_reject[channel_id];
             else              ++s_bloom_maybe[channel_id];
+          }
+          // Every translated request reads the exact dead-bank bitmap. Bloom is
+          // one logical post-D probe; the F1 parallel two-copy implementation is
+          // accounted for explicitly in the analytical power model. A dead-bank
+          // relocation additionally reads its ordinal and one live-bank entry.
+          ++s_meta_dead_bitmap_read[channel_id];
+          if (m_repair_translator->bloom_enabled()) ++s_meta_bloom_probe[channel_id];
+          if (abc_lookup) ++s_meta_abc_read[channel_id];
+          if (source_dead) {
+            ++s_meta_d_ordinal_read[channel_id];
+            ++s_meta_d_live_list_read[channel_id];
+          }
+          if (layer_a_sram) {
+            if (req.type_id == Request::Type::Write) ++s_layer_a_data_write[channel_id];
+            else                                      ++s_layer_a_data_read[channel_id];
           }
           if (lookup_fast) ++s_lookup_fast[channel_id];
           else             ++s_lookup_slow[channel_id];
