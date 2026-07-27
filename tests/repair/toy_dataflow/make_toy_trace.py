@@ -70,12 +70,21 @@ class Geometry:
 class Table:
     """Mirror of HbmRepairTable, loaded from a repairv2 remap JSON."""
 
-    def __init__(self, path):
+    def __init__(self, path, d_mapping="spread"):
         d = json.load(open(path))
         self.cfg = d["config"]
+        self.d_mapping = d_mapping
         self.bad = {(b["ch"], b["pch"], b["bg"], b["ba"]) for b in d["layer_d_bad_banks"]}
-        self.sram = {(e["ch"], e["pch"], e["bg"], e["ba"], e["row"]): e["sram_slot"]
-                     for e in d["layer_a_sram"]}
+        self.sram = {}
+        tx_granular = self.cfg.get("layer_a_granularity", "row") == "transaction"
+        for e in d["layer_a_sram"]:
+            key = (e["ch"], e["pch"], e["bg"], e["ba"], e["row"])
+            if tx_granular:
+                entry = e
+            else:
+                entry = {"col_start": 0, "length": self.cfg["bursts_per_row"],
+                         "target_slot": e["sram_slot"]}
+            self.sram.setdefault(key, []).append(entry)
         self.ded, self.burst = {}, {}
         for b in d["banks"]:
             k = (b["ch"], b["pch"], b["bg"], b["ba"])
@@ -100,7 +109,7 @@ class Table:
         res = "none"
         if (ch, pch, bg, ba) in self.bad:
             return "layer_d"          # D relocates then falls through; it still reports D
-        if (ch, pch, bg, ba, row) in self.sram:
+        if self.sram_hit((ch, pch, bg, ba, row), col):
             return "layer_a"
         if (ch, pch, bg, ba, row) in self.ded:
             return "layer_b"
@@ -110,18 +119,36 @@ class Table:
                 return "layer_c"
         return res
 
+    def sram_hit(self, key, col):
+        for e in self.sram.get(key, []):
+            if e["col_start"] <= col < e["col_start"] + e["length"]:
+                return e
+        return None
+
     def route(self, ch, pch, bg, ba, row, col):
         """Mirror pre-controller D routing and the Layer-A SRAM bypass."""
         source = (ch, pch, bg, ba)
         result = "none"
         if source in self.bad:
             result = "layer_d"
-            h = (self.cfg["rows_per_bank"] + len(self.live) - 1) // len(self.live)
             ordinal = self.dead.index(source)
-            ch, pch, bg, ba = self.live[row // h]
-            row = self.cfg["rows_per_bank"] - (ordinal + 1) * h + row % h
+            R = self.cfg["rows_per_bank"]
+            if self.d_mapping == "clustered":
+                V = self.cfg["vacuum_limit"]
+                assert 0 < V <= R
+                banks_per_dead = (R + V - 1) // V
+                total_targets = len(self.dead) * banks_per_dead
+                assert total_targets <= len(self.live)
+                slot = (row // V) * len(self.dead) + ordinal
+                target_index = slot * len(self.live) // total_targets
+                ch, pch, bg, ba = self.live[target_index]
+                row = R - V + row % V
+            else:
+                h = (R + len(self.live) - 1) // len(self.live)
+                ch, pch, bg, ba = self.live[row // h]
+                row = R - (ordinal + 1) * h + row % h
         key = (ch, pch, bg, ba, row)
-        uses_sram = key in self.sram
+        uses_sram = self.sram_hit(key, col) is not None
         if result == "none":
             result = self.classify(ch, pch, bg, ba, row, col)
         return result, ch, uses_sram
@@ -133,11 +160,13 @@ def main():
     p.add_argument("--trace", required=True)
     p.add_argument("--expect", required=True)
     p.add_argument("--n", type=int, default=8, help="requests per layer")
+    p.add_argument("--d-mapping", choices=["spread", "clustered"], default="spread",
+                   help="independent Layer-D placement model to predict")
     p.add_argument("--tx_bits", type=int, default=5,
                    help="log2(transaction bytes); 5 = 32 B (prefetch 2 x 128b/8)")
     a = p.parse_args()
 
-    t = Table(a.json)
+    t = Table(a.json, a.d_mapping)
     g = Geometry(t.cfg, a.tx_bits)
     N_AV_COLS = g.n_cols
     print(f"[toy] geometry from the table's own config block: {g.describe()}")
@@ -150,8 +179,11 @@ def main():
 
     # -- Layer D: a dead bank. Any row must be relocated.
     for (ch, pch, bg, ba) in sorted(t.bad)[:1]:
+        # Span the complete bank so clustered mode reaches its last target group;
+        # this also preserves the cross-channel routing regression.
         for i in range(a.n):
-            add(ch, pch, bg, ba, i * 991 % t.cfg["rows_per_bank"], 0, "layer_d")
+            row = i * (t.cfg["rows_per_bank"] - 1) // max(a.n - 1, 1)
+            add(ch, pch, bg, ba, row, 0, "layer_d")
 
     # -- Layer A: channel-SRAM rows (skip banks that are dead).
     n = 0
@@ -160,8 +192,12 @@ def main():
             break
         if (ch, pch, bg, ba) in t.bad:
             continue
-        add(ch, pch, bg, ba, row, 0, "layer_a")
-        n += 1
+        for e in t.sram[(ch, pch, bg, ba, row)]:
+            if n >= a.n:
+                break
+            col = e["col_start"] + (n % e["length"])
+            add(ch, pch, bg, ba, row, col, "layer_a")
+            n += 1
 
     # -- Layer B: dedicated spare rows (must not also be a Layer A row).
     n = 0
@@ -239,6 +275,7 @@ def main():
               open(a.expect, "w"), indent=1)
 
     print(f"[toy] {len(reqs)} requests -> {a.trace}")
+    print(f"[toy] Layer-D mapping: {a.d_mapping}")
     print(f"[toy] predicted: {expect}")
     print(f"[toy] predicted DRAM-controller reads: {dram_channel_reads}")
     intents = {}

@@ -116,6 +116,21 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
         // latency -- the conservative bracket, and what the old code did.
         const bool unified_gate = controller_cfg["repair_unified_gate"]
                                 ? controller_cfg["repair_unified_gate"].as<bool>() : true;
+        // Preserve the published spread mapping as the default. Clustered is an
+        // opt-in placement experiment using exclusive target-bank ownership and
+        // vacuum_limit-row contiguous chunks; it changes addresses, not lookup
+        // timing or the reserved-capacity budget.
+        const std::string d_mapping_name = controller_cfg["repair_d_mapping"]
+                                         ? controller_cfg["repair_d_mapping"].as<std::string>()
+                                         : "spread";
+        LayerDMapping d_mapping;
+        if (d_mapping_name == "spread")
+          d_mapping = LayerDMapping::SPREAD;
+        else if (d_mapping_name == "clustered")
+          d_mapping = LayerDMapping::CLUSTERED;
+        else
+          throw std::runtime_error(
+              "repair_d_mapping must be 'spread' or 'clustered'");
         // 512-bit blocks; conservative entry sizing measures 0.1747% FP on
         // worst die 193 (300k live-bank negative probes).
         const int bloom_bits_per_key = controller_cfg["repair_bloom_bits_per_key"]
@@ -123,7 +138,8 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
         const int bloom_k = controller_cfg["repair_bloom_probes"]
                           ? controller_cfg["repair_bloom_probes"].as<int>() : 8;
         m_repair_translator = std::make_unique<RepairTranslator>(
-            m_repair_table, bloom, bloom_bits_per_key, bloom_k, unified_gate);
+            m_repair_table, bloom, bloom_bits_per_key, bloom_k, unified_gate,
+            d_mapping);
       }
 
       // Create memory controllers
@@ -304,6 +320,13 @@ class GenericDRAMSystem final : public IMemorySystem, public Implementation {
     
     void tick() override {
       m_clk++;
+      // Native DRAM time advances while an address is in the repair pipeline.
+      // Therefore an already-existing timing constraint is NOT restarted when
+      // the request reaches the controller. Example: if the target can issue at
+      // absolute cycle 15 and a slow lookup occupies cycles 0..12, check_ready()
+      // below sees the device at cycle 12 and only three constrained cycles
+      // remain. The request is not yet visible for queue-contention scheduling,
+      // but its original arrival timestamp is preserved when it is enqueued.
       m_dram->tick();
       for (auto it = m_repair_pipeline.begin(); it != m_repair_pipeline.end(); ) {
         if (it->ready > m_clk) { ++it; continue; }

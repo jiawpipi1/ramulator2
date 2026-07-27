@@ -4,7 +4,8 @@
 //
 // JSON field mapping (new pch/bg/ba format):
 //   "layer_d_bad_banks": [{"ch","pch","bg","ba"}, ...]          -> Table 1 (Layer D)
-//   "layer_a_sram":      [{"ch","pch","bg","ba","row","sram_slot"},...] -> Table 2 (Layer A)
+//   "layer_a_sram":      [{"ch","pch","bg","ba","row","col_start",
+//                           "length","target_slot"},...] -> Table 2 (Layer A)
 //   "banks": [{
 //     "ch","pch","bg","ba",
 //     "layer_b_ded_rows": [row,...],                             -> Table 3 (Layer B)
@@ -39,9 +40,11 @@ struct BurstEntry {
 struct RepairConfig {
   int total_spare_rows = 4;
   int bursts_per_row   = 32;
+  int transaction_bytes = 32;
   int ded_count        = 2;  // total_spare_rows / 2
   int frag_count       = 2;  // total_spare_rows - ded_count
-  int sram_slots       = 16;
+  int sram_slots       = 32;
+  bool layer_a_transaction_granularity = false; // false loads legacy full-row tables
   int rows_per_bank    = 16384;
   int vacuum_limit     = 32;
 
@@ -71,6 +74,10 @@ struct HbmRepairTable {
   std::set<BankKey> bad_bank_set;
 
   
+  // New tables map faulty transaction ranges into channel-local SRAM slots.
+  std::map<BurstKey, BurstEntry> sram_tx_map;
+
+  // Legacy compatibility for the pre-granularity full-row JSON tables.
   std::map<RowKey, int> sram_full_map;
 
   
@@ -92,6 +99,16 @@ struct HbmRepairTable {
     int frag = target_slot / cfg.bursts_per_row;
     int col  = target_slot % cfg.bursts_per_row;
     int row  = cfg.burst_spare_base() + frag;
+    return {row, col};
+  }
+
+  // Virtual {row,col} used to make a transaction-granular Layer-A target
+  // visible in debug/tests. The request bypasses DRAM and is served by the
+  // channel-local SRAM, so this address is not a DRAM row allocation.
+  std::pair<int,int> sram_slot_to_addr(int target_slot) const {
+    int row = cfg.rows_per_bank + cfg.total_spare_rows
+            + target_slot / cfg.bursts_per_row;
+    int col = target_slot % cfg.bursts_per_row;
     return {row, col};
   }
 

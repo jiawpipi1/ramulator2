@@ -23,6 +23,10 @@ int main(int argc, char** argv) {
 
   std::set<RowKey> exact;
   for (const auto& [key, value] : table.sram_full_map) exact.insert(key);
+  for (const auto& [key, value] : table.sram_tx_map) {
+    const auto& [ch, pch, bg, ba, row, col] = key;
+    exact.insert({ch, pch, bg, ba, row});
+  }
   for (const auto& [key, value] : table.ded_row_map) exact.insert(key);
   for (const auto& [key, value] : table.burst_map) {
     const auto& [ch, pch, bg, ba, row, col] = key;
@@ -47,7 +51,8 @@ int main(int argc, char** argv) {
     ++negatives;
   }
 
-  const size_t capacity_entries = table.sram_full_map.size()
+  const size_t capacity_entries = table.sram_tx_map.size()
+                                + table.sram_full_map.size()
                                 + table.ded_row_map.size()
                                 + table.burst_map.size();
   std::cout << "table=" << table.hbm_id

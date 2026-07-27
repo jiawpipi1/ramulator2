@@ -33,10 +33,12 @@ static const char* KNOWN_JSON = R"JSON(
   "hbm_id": 7,
   "K": 65,
   "config": {"rows_per_bank":16384,"total_spare_rows":4,"sram_slots":16,
-             "vacuum_limit":128,"bursts_per_row":32,
+             "vacuum_limit":128,"bursts_per_row":32,"transaction_bytes":32,
+             "layer_a_granularity":"transaction",
              "num_channels":8,"num_pch":2,"num_bg":4,"num_ba":4},
   "layer_d_bad_banks": [ {"ch":0,"pch":0,"bg":0,"ba":0} ],
-  "layer_a_sram": [ {"ch":3,"pch":1,"bg":0,"ba":2,"row":500,"sram_slot":6} ],
+  "layer_a_sram": [ {"ch":3,"pch":1,"bg":0,"ba":2,"row":500,
+                       "col_start":6,"length":2,"target_slot":6} ],
   "banks": [
     { "ch":4,"pch":0,"bg":1,"ba":3,
       "layer_b_ded_rows": [300, 305],
@@ -60,7 +62,10 @@ int main(int argc, char** argv) {
     check(t.cfg.num_channels==8 && t.cfg.num_pch==2 && t.cfg.num_bg==4 && t.cfg.num_ba==4
           && t.cfg.rows_per_bank==16384, "config block parsed (geometry)");
     check(t.bad_bank_set.size() == 1 && t.bad_bank_set.count({0,0,0,0})==1, "Layer D: {(0,0,0,0)}");
-    check(t.sram_full_map.size()==1 && t.sram_full_map.at({3,1,0,2,500})==6, "Layer A: (3,1,0,2,500)->slot6");
+    check(t.cfg.layer_a_transaction_granularity && t.cfg.transaction_bytes==32,
+          "transaction-granular Layer A config parsed");
+    check(t.sram_tx_map.size()==1 && t.sram_tx_map.at({3,1,0,2,500,6}).target_slot==6,
+          "Layer A: (3,1,0,2,500,col6..7)->slots6..7");
     check(t.ded_row_map.size()==2 && t.ded_row_map.at({4,0,1,3,300})==0
           && t.ded_row_map.at({4,0,1,3,305})==1, "Layer B: rows 300->off0, 305->off1");
     check(t.burst_map.size()==2, "Layer C: 2 burst segments");
@@ -89,6 +94,8 @@ int main(int argc, char** argv) {
                  "reject inexact K without mutating output");
     invalid_load(KNOWN_JSON, "\"col_start\":20", "\"col_start\":10",
                  "reject overlapping Layer C source ranges");
+    invalid_load(KNOWN_JSON, "\"target_slot\":6", "\"target_slot\":15",
+                 "reject overflowing Layer A transaction range");
     { std::ofstream o(known_path); o << KNOWN_JSON; }
 
     // ---- loaded table drives translate() correctly -------------------------
@@ -108,7 +115,10 @@ int main(int argc, char** argv) {
     // F=1, L=255, h=ceil(16384/255)=65; row 25 -> o=25 -> row RPB-65+25.
     check(T.num_dead()==1 && T.num_live()==255 && T.band_h()==65, "D geometry from JSON: F=1 L=255 h=65");
     exp(A(0,0,0,0, 25, 3), RepairType::LAYER_D, A(0,0,0,1, RPB - T.band_h() + 25, 3), "D relocate row=25");
-    exp(A(3,1,0,2, 500,7), RepairType::LAYER_A, A(3,1,0,2, RPB+t.cfg.total_spare_rows+6, 7), "A slot6");
+    exp(A(3,1,0,2, 500,7), RepairType::LAYER_A,
+        A(3,1,0,2, RPB+t.cfg.total_spare_rows, 7), "A transaction slot7");
+    exp(A(3,1,0,2, 500,5), RepairType::NONE,
+        A(3,1,0,2, 500,5), "A same-row clean transaction misses");
     exp(A(4,0,1,3, 300,1), RepairType::LAYER_B, A(4,0,1,3, RPB+0, 1), "B row300 off0");
     exp(A(4,0,1,3, 305,1), RepairType::LAYER_B, A(4,0,1,3, RPB+1, 1), "B row305 off1");
     exp(A(4,0,1,3, 600,9), RepairType::LAYER_C, A(4,0,1,3, RPB+t.cfg.ded_count+0, 3), "C seg0 preserves offset");
@@ -129,7 +139,7 @@ int main(int argc, char** argv) {
         check(r.hbm_id >= 0, "real sample has hbm_id");
         check(r.cfg.num_channels==16 && r.cfg.rows_per_bank==16384,
               "real sample config block parsed (HBM3 geometry)");
-        check(r.bad_bank_set.size() + r.sram_full_map.size()
+        check(r.bad_bank_set.size() + r.sram_full_map.size() + r.sram_tx_map.size()
               + r.ded_row_map.size() + r.burst_map.size() > 0, "real sample has non-empty tables");
         r.print_summary(std::cout);
     }

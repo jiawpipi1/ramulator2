@@ -44,8 +44,9 @@ def main():
         build("repair_algo_trad.cpp", trad)
         build("my_fault_gen/fault_generator.cpp", micro)
 
-        # A row that cannot fit Layer C must not retain partial entries. Reclaiming
-        # them lets the final cheap row fit, so only one Layer-A slot is needed.
+        # Layer C must choose the subset that covers the most faulty transaction
+        # units. Here rows 0,1,3 exactly fill its 32 registers/slots, leaving the
+        # ten isolated transactions of row 2 for transaction-granular Layer A.
         groups = {
             100: range(32), 101: range(32),
             0: range(0, 30, 2), 1: range(0, 24, 2),
@@ -53,7 +54,7 @@ def main():
         }
         json_dir = td / "json"
         p = run(repair, [
-            "--input", "-", "--rs", "4", "--sram_slots", "1",
+            "--input", "-", "--rs", "4", "--sram_slots", "10",
             "--vacuum_limit", "4096", "--num_channels", "1",
             "--num_banks", "8", "--bursts", "32", "--num_dies", "2",
             "--dump-json", "--json-dir", str(json_dir),
@@ -61,7 +62,12 @@ def main():
         assert p.returncode == 0, p.stderr
         assert "Total dies        : 2" in p.stdout
         table = json.loads((json_dir / "remap_hbm_0.json").read_text())
-        assert len(table["layer_a_sram"]) == 1
+        assert table["config"]["layer_a_granularity"] == "transaction"
+        assert table["config"]["transaction_bytes"] == 32
+        assert len(table["layer_a_sram"]) == 10
+        assert sum(e["length"] for e in table["layer_a_sram"]) == 10
+        assert {e["row"] for e in table["layer_a_sram"]} == {2}
+        assert {e["target_slot"] for e in table["layer_a_sram"]} == set(range(10))
         assert not table["layer_d_bad_banks"]
         a_rows = {(e["ch"], e["pch"], e["bg"], e["ba"], e["row"])
                   for e in table["layer_a_sram"]}

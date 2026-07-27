@@ -3,7 +3,8 @@
 // Standalone functional-correctness unit test for RepairTranslator.
 // Builds an HbmRepairTable in memory (no JSON, no full Ramulator build) and
 // checks every layer's translation, boundary conditions, the Layer D
-// dead-bank relocation + fall-through to A/B/C, and structural invariants.
+// dead-bank relocation under both spread and clustered placement,
+// fall-through to A/B/C, and structural invariants.
 //
 // Build (from ramulator2/):
 //   g++ -std=c++17 -Itests/repair/stubs -Isrc \
@@ -12,7 +13,10 @@
 // Addr_vec layout: [0]=ch [1]=pch [2]=bg [3]=ba [4]=row [5]=col
 
 #include <iostream>
+#include <set>
+#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "dram_controller/impl/repair/repair_table.h"
@@ -65,7 +69,8 @@ int main() {
     t.cfg.num_bg       = 1;
     t.cfg.num_ba       = 8;
     t.cfg.vacuum_limit = 1024;
-    const RepairConfig& c = t.cfg;      // rpb=16384, tsr=4, ded=2, frag=2, bpr=32, sram=16
+    t.cfg.layer_a_transaction_granularity = true;
+    const RepairConfig& c = t.cfg;      // rpb=16384, tsr=4, ded=2, frag=2, bpr=32, sram=32
     const int RPB = c.rows_per_bank;    // 16384
 
     // Layer D: dead banks (0,0,0,0)=ord0 and (0,0,0,1)=ord1.
@@ -74,11 +79,14 @@ int main() {
     t.bad_bank_set.insert({0,0,0,0});
     t.bad_bank_set.insert({0,0,0,1});
 
-    // Layer A: normal (live) banks
-    t.sram_full_map[{1,0,0,3,512}] = 4;
-    t.sram_full_map[{3,0,0,1,60}]  = 2;   // beats B on the same row
+    // Layer A: transaction-granular ranges on normal (live) banks.
+    auto addA = [&](int ch,int pch,int bg,int ba,int row,int cs,int len,int slot){
+        t.sram_tx_map[{ch,pch,bg,ba,row,cs}] = BurstEntry{row,cs,len,slot};
+    };
+    addA(1,0,0,3,512,5,2,4);
+    addA(3,0,0,1,60,4,1,2);   // beats B only on the faulty transaction
     // fall-through target: dead1 row2 relocates to (0,0,0,2,15856)
-    t.sram_full_map[{0,0,0,2,15856}] = 3;
+    addA(0,0,0,2,15856,7,1,3);
 
     // Layer B
     t.ded_row_map[{1,0,0,3,800}] = 0;
@@ -117,10 +125,62 @@ int main() {
     // fall-through: relocated top row is itself faulty -> A/B/C also applied, still reports LAYER_D
     expect_D(T, A(0,0,0,1, 0,   5), A(0,0,0,2, B_base+1, 5), "D->B fall-through (dead1 row0)");
     expect_D(T, A(0,0,0,1, 1,   9), A(0,0,0,2, C_base,   1), "D->C fall-through preserves range offset");
-    expect_D(T, A(0,0,0,1, 2,   7), A(0,0,0,2, A_base+3, 7), "D->A fall-through (dead1 row2)");
+    expect_D(T, A(0,0,0,1, 2,   7), A(0,0,0,2, A_base, 3), "D->A fall-through (dead1 row2)");
+
+    std::cout << "== Layer D clustered placement (opt-in; spread remains default) ==\n";
+    HbmRepairTable tc = t;
+    // Balanced exclusive target selection: F=2, L=62, q=16, M=32.
+    // dead1 row0 -> slot1 -> floor(1*62/32)=live[1]=(0,0,0,3).
+    // Make that target faulty to prove clustered D->A/B/C fall-through too.
+    tc.ded_row_map[{0,0,0,3,RPB-1024}] = 0;
+    RepairTranslator TC(tc, true, 16, 8, true, LayerDMapping::CLUSTERED);
+    check(T.layer_d_mapping() == LayerDMapping::SPREAD,
+          "spread remains the constructor default");
+    check(TC.layer_d_mapping() == LayerDMapping::CLUSTERED,
+          "clustered placement is explicitly selectable");
+    check(TC.cluster_banks_per_dead()==16,
+          "clustered geometry: ceil(16384/1024)=16 target banks/dead bank");
+    check(TC.vacuum_rows_per_bank()==1024,
+          "clustered target chunk uses vacuum_limit=1024 rows");
+    expect_D(TC, A(0,0,0,0,0,5),
+             A(0,0,0,2,RPB-1024,5), "clustered dead0 row0 -> live[0] chunk base");
+    expect_D(TC, A(0,0,0,0,1023,5),
+             A(0,0,0,2,RPB-1,5), "clustered dead0 row1023 -> first chunk end");
+    expect_D(TC, A(0,0,0,0,1024,5),
+             A(0,0,0,5,RPB-1024,5), "clustered dead0 row1024 -> next exclusive target");
+    expect_D(TC, A(0,0,0,0,RPB-1,5),
+             A(7,0,0,4,RPB-1,5), "clustered dead0 last row -> balanced live[58]");
+    expect_D(TC, A(0,0,0,1,0,5),
+             A(0,0,0,3,B_base,5), "clustered D->B fall-through remains active");
+    { AddrVec_t v=A(0,0,0,1,0,5); TC.translate(v);
+      check(TC.last_layer_d_then_abc() && !TC.last_fast_path(),
+            "clustered D->A/B/C is visible and stays on slow path"); }
+    bool clustered_injective = true;
+    std::set<std::tuple<int,int,int,int,int>> clustered_targets;
+    for (int db = 0; db < 2; ++db) {
+        for (int r = 0; r < RPB; ++r) {
+            AddrVec_t v=A(0,0,0,db,r,0); TC.translate(v);
+            auto target=std::make_tuple(v[0],v[1],v[2],v[3],v[4]);
+            if (!clustered_targets.insert(target).second) clustered_injective=false;
+        }
+    }
+    check(clustered_injective,
+          "clustered Layer-D mapping is injective across both dead banks");
+    bool rejected_bad_cluster_geometry = false;
+    try {
+        HbmRepairTable too_small = t;
+        too_small.cfg.vacuum_limit = 128; // 2*128 target banks > 62 live banks
+        RepairTranslator bad(too_small, true, 16, 8, true,
+                             LayerDMapping::CLUSTERED);
+    } catch (const std::invalid_argument&) {
+        rejected_bad_cluster_geometry = true;
+    }
+    check(rejected_bad_cluster_geometry,
+          "clustered placement rejects insufficient exclusive target banks");
 
     std::cout << "== Layer A / B / C on live banks ==\n";
-    expect(T, A(1,0,0,3, 512, 5), RepairType::LAYER_A, A(1,0,0,3, A_base+4, 5), "A hit slot=4");
+    expect(T, A(1,0,0,3, 512, 5), RepairType::LAYER_A, A(1,0,0,3, A_base, 4), "A transaction hit slot=4");
+    expect(T, A(1,0,0,3, 512, 7), RepairType::NONE, A(1,0,0,3, 512, 7), "A clean transaction in same row misses");
     expect(T, A(1,0,0,3, 513, 5), RepairType::NONE,    A(1,0,0,3, 513,      5), "A miss -> NONE");
     expect(T, A(1,0,0,3, 800, 1), RepairType::LAYER_B, A(1,0,0,3, B_base+0, 1), "B offset0");
     expect(T, A(1,0,0,3, 801, 1), RepairType::LAYER_B, A(1,0,0,3, B_base+1, 1), "B offset1");
@@ -132,14 +192,14 @@ int main() {
     expect(T, A(1,0,0,3, 900, 20), RepairType::LAYER_C, A(1,0,0,3, C_base, 8), "C 3rd entry slot8");
 
     std::cout << "== Layer priority on a live bank (A>B>C) ==\n";
-    expect(T, A(3,0,0,1, 60, 4), RepairType::LAYER_A, A(3,0,0,1, A_base+2, 4), "A beats B");
+    expect(T, A(3,0,0,1, 60, 4), RepairType::LAYER_A, A(3,0,0,1, A_base, 2), "A beats B on matching transaction");
     expect(T, A(3,0,0,2, 70, 9), RepairType::LAYER_B, A(3,0,0,2, B_base+0, 9), "B beats C");
 
     std::cout << "== Pass-through (NONE) ==\n";
     expect(T, A(5,0,0,0, 123, 45), RepairType::NONE, A(5,0,0,0, 123, 45), "clean addr unchanged");
 
     std::cout << "== Structural invariants ==\n";
-    int A_lo=A_base, A_hi=A_base+c.sram_slots;
+    int A_lo=A_base, A_hi=A_base+(c.sram_slots+c.bursts_per_row-1)/c.bursts_per_row;
     int B_lo=B_base, B_hi=B_base+c.ded_count;
     int C_lo=C_base, C_hi=C_base+c.frag_count;
     auto disjoint=[](int l1,int h1,int l2,int h2){ return h1<=l2||h2<=l1; };

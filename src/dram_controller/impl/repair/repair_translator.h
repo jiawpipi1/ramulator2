@@ -9,13 +9,15 @@
 //   Layer D (dead bank) : RELOCATE the access to a live bank's reserved top-row
 //                         band, then re-check Bloom and FALL THROUGH to A/B/C on
 //                         the relocated address (the target row may be faulty).
-//   Layer A (SRAM)      : overflow row -> SRAM replacement row.
+//   Layer A (SRAM)      : overflow transaction range -> channel SRAM slots.
 //   Layer B (DED)       : faulty row   -> dedicated whole-row spare.
 //   Layer C (burst)     : faulty col range -> burst spare slot.
 // A/B/C are mutually exclusive for a given (bank,row). Layer D cannot re-fire
 // after relocation because the target is a live bank (never in bad_bank_set).
 //
-// Layer D interleave (combinational, no per-row table):
+// Layer D placement (combinational, no per-row table). Two policies coexist:
+//
+// SPREAD (published/original, default):
 //   Let R  = rows_per_bank, F = #dead banks, L = #live banks (all banks - dead).
 //       h  = ceil(R / L)                    (band height: rows one dead bank
 //                                            places in each live bank)
@@ -29,6 +31,18 @@
 //   the next band down, etc. The union of bands is the per-live-bank vacuum
 //   region [R - F*h, R) that the OS is told not to use.
 //
+// CLUSTERED (opt-in locality experiment):
+//   Let V = vacuum_limit, q = ceil(R / V), and M = F*q exclusive target slots.
+//   Slot s=(r/V)*F+i interleaves dead-bank ownership; evenly sample M unique
+//   entries from the full L-entry live list with j=floor(s*L/M):
+//       tgt  = live_banks[floor(((r/V)*F+i)*L/(F*q))]
+//       trow = R - V + r%V
+//   Thus a worst-case HBM3 dead bank uses 32 target banks x 512 contiguous rows
+//   instead of all 497 live banks x 33-row runs. Interleaving and even sampling
+//   keep those exclusive targets balanced across channels even when F is small.
+//   The same V rows remain reserved in every live bank, so this changes
+//   placement, not the capacity budget.
+//
 // When Ramulator::g_debug_address is true (--debug-address) translate() prints
 // a per-request trace of every layer lookup.
 //
@@ -38,6 +52,8 @@
 #include <iostream>
 #include <cstdint>
 #include <map>
+#include <stdexcept>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -152,10 +168,20 @@ static constexpr int AIDX_COL = 5;
 
 enum class RepairType { NONE, LAYER_A, LAYER_B, LAYER_C, LAYER_D };
 
+// Layer-D placement policy. SPREAD is the published/original mapping and stays
+// the default so old configurations and result directories remain reproducible.
+// CLUSTERED is opt-in: one dead bank consumes vacuum_limit consecutive rows in
+// each of ceil(rows_per_bank / vacuum_limit) exclusively assigned live banks.
+enum class LayerDMapping { SPREAD, CLUSTERED };
+
+inline const char* layer_d_mapping_name(LayerDMapping m) {
+    return m == LayerDMapping::CLUSTERED ? "clustered" : "spread";
+}
+
 inline const char* repair_type_name(RepairType t) {
     switch (t) {
         case RepairType::NONE:    return "NONE (pass-through)";
-        case RepairType::LAYER_A: return "LAYER_A (SRAM overflow row)";
+        case RepairType::LAYER_A: return "LAYER_A (SRAM overflow transaction)";
         case RepairType::LAYER_B: return "LAYER_B (DED whole-row spare)";
         case RepairType::LAYER_C: return "LAYER_C (burst col-range SRAM)";
         case RepairType::LAYER_D: return "LAYER_D (dead-bank relocate + A/B/C)";
@@ -171,9 +197,12 @@ public:
     // the thing that mattered.
     explicit RepairTranslator(const HbmRepairTable& tbl, bool enable_bloom = true,
                               int bloom_bits_per_key = 16, int bloom_k = 8,
-                              bool unified_gate = true)
-        : m_tbl(tbl), m_bloom_enabled(enable_bloom), m_unified_gate(unified_gate) {
+                              bool unified_gate = true,
+                              LayerDMapping layer_d_mapping = LayerDMapping::SPREAD)
+        : m_tbl(tbl), m_layer_d_mapping(layer_d_mapping),
+          m_bloom_enabled(enable_bloom), m_unified_gate(unified_gate) {
         build_bank_lists();
+        validate_layer_d_mapping();
         if (m_bloom_enabled) build_bloom(bloom_bits_per_key, bloom_k);
     }
 
@@ -181,8 +210,16 @@ public:
     int num_live()  const { return m_num_live; }
     int num_dead()  const { return m_num_dead; }
     int band_h()    const { return m_band_h; }
-    // Rows reserved per live bank as the Layer D vacuum region.
-    int vacuum_rows_per_bank() const { return m_num_dead * m_band_h; }
+    int cluster_banks_per_dead() const { return m_cluster_banks_per_dead; }
+    LayerDMapping layer_d_mapping() const { return m_layer_d_mapping; }
+    // Maximum rows occupied in a participating live bank. Spread uses one h-row
+    // band per dead bank; clustered uses the configured vacuum_limit in each
+    // exclusively assigned target bank. The capacity contract still reserves
+    // vacuum_limit rows in every live bank for either selectable policy.
+    int vacuum_rows_per_bank() const {
+        return m_layer_d_mapping == LayerDMapping::CLUSTERED
+             ? m_tbl.cfg.vacuum_limit : m_num_dead * m_band_h;
+    }
 
     // Bloom introspection / stats (cumulative across translate() calls).
     bool   bloom_enabled()   const { return m_bloom_enabled; }
@@ -255,22 +292,33 @@ public:
         // -- Layer D: dead bank -> relocate to a live bank's reserved band -----
         if (source_dead) {
             auto it = m_dead_ordinal.find(source_bank);
-            bool ok = (it != m_dead_ordinal.end()) && m_num_live > 0 && m_band_h > 0;
-            int j = ok ? (row / m_band_h) : -1;
+            const bool clustered = m_layer_d_mapping == LayerDMapping::CLUSTERED;
+            const int rows_per_target = clustered ? m_tbl.cfg.vacuum_limit : m_band_h;
+            bool ok = (it != m_dead_ordinal.end()) && m_num_live > 0 && rows_per_target > 0;
+            int i = ok ? it->second : -1;
+            int j = ok ? row / rows_per_target : -1;
+            if (clustered && ok) {
+                const long long slot = 1LL * j * m_num_dead + i;
+                const long long total_targets =
+                    1LL * m_num_dead * m_cluster_banks_per_dead;
+                j = static_cast<int>(slot * m_num_live / total_targets);
+            }
             if (ok && j < m_num_live) {
-                int i = it->second;
-                int o = row % m_band_h;
+                int o = row % rows_per_target;
                 const auto& tgt = m_live_banks[j];
                 int tch  = std::get<0>(tgt);
                 int tpch = std::get<1>(tgt);
                 int tbg  = std::get<2>(tgt);
                 int tba  = std::get<3>(tgt);
-                int trow = m_R - (i + 1) * m_band_h + o;
+                int trow = clustered
+                         ? m_R - m_tbl.cfg.vacuum_limit + o
+                         : m_R - (i + 1) * m_band_h + o;
                 if (dbg) {
-                    std::cerr << "  [Layer D] dead ord=" << i << " row=" << row
+                    std::cerr << "  [Layer D:" << layer_d_mapping_name(m_layer_d_mapping)
+                        << "] dead ord=" << i << " row=" << row
                         << " -> live[" << j << "]=(" << tch << "," << tpch << ","
                         << tbg << "," << tba << ") row=" << trow
-                        << "  (h=" << m_band_h << " F=" << m_num_dead
+                        << "  (rows/target=" << rows_per_target << " F=" << m_num_dead
                         << " L=" << m_num_live << ")  -> fall through to A/B/C\n";
                 }
                 av[AIDX_CH] = ch = tch;
@@ -327,7 +375,33 @@ public:
         // lookup.  This is one logical table access even if all three maps miss.
         m_last_abc_lookup = true;
 
-        // -- Layer A: SRAM overflow row ---------------------------------------
+        // -- Layer A: channel-local SRAM -------------------------------------
+        // New tables remap only the faulty transaction units. Legacy full-row
+        // tables remain readable so historical experiments are reproducible.
+        {
+            auto it = m_tbl.sram_tx_map.lower_bound(
+                std::make_tuple(ch, pch, bg, ba, row, 0));
+            while (it != m_tbl.sram_tx_map.end()) {
+                auto& [key, be] = *it;
+                auto& [kch, kpch, kbg, kba, krow, kcol] = key;
+                if (kch != ch || kpch != pch || kbg != bg ||
+                    kba != ba || krow != row) break;
+                if (col >= be.col_start && col < be.col_start + be.length) {
+                    int target = be.target_slot + (col - be.col_start);
+                    auto [new_row, new_col] = m_tbl.sram_slot_to_addr(target);
+                    if (dbg) std::cerr << "  [Layer A] transaction slot " << target
+                                       << " -> virtual row " << new_row
+                                       << " col " << new_col << "\n";
+                    av[AIDX_ROW] = new_row;
+                    av[AIDX_COL] = new_col;
+                    m_last_layer_a = true;
+                    m_last_d_abc = (d_result == RepairType::LAYER_D);
+                    return d_result == RepairType::LAYER_D ? RepairType::LAYER_D
+                                                           : RepairType::LAYER_A;
+                }
+                ++it;
+            }
+        }
         {
             auto it = m_tbl.sram_full_map.find(std::make_tuple(ch, pch, bg, ba, row));
             if (it != m_tbl.sram_full_map.end()) {
@@ -411,6 +485,20 @@ private:
         m_num_dead = ord;
         m_num_live = static_cast<int>(m_live_banks.size());
         m_band_h   = (m_num_live > 0) ? (m_R + m_num_live - 1) / m_num_live : 0;
+        const int v = c.vacuum_limit;
+        m_cluster_banks_per_dead = v > 0 ? (m_R + v - 1) / v : 0;
+    }
+
+    void validate_layer_d_mapping() const {
+        if (m_layer_d_mapping != LayerDMapping::CLUSTERED || m_num_dead == 0) return;
+        const int v = m_tbl.cfg.vacuum_limit;
+        if (v <= 0 || v > m_R)
+            throw std::invalid_argument(
+                "clustered Layer-D mapping requires 0 < vacuum_limit <= rows_per_bank");
+        const long long targets = 1LL * m_num_dead * m_cluster_banks_per_dead;
+        if (targets > m_num_live)
+            throw std::invalid_argument(
+                "clustered Layer-D mapping needs more exclusive target banks than are live");
     }
 
     // Insert every fine-grained A/B/C (bank,row) repair key. Layer D is NOT
@@ -421,11 +509,16 @@ private:
         // few more bits than unique-key sizing; the CACTI capacity model uses
         // the same rule. Preserve it because the published Claim-2 matrix used
         // this organization.
-        size_t n = m_tbl.sram_full_map.size() + m_tbl.ded_row_map.size()
+        size_t n = m_tbl.sram_tx_map.size() + m_tbl.sram_full_map.size()
+                 + m_tbl.ded_row_map.size()
                  + m_tbl.burst_map.size();
         m_bloom.build(n, bits_per_key, k);
         for (auto& [key, v] : m_tbl.sram_full_map) {
             auto& [ch, pch, bg, ba, row] = key;
+            m_bloom.insert(bank_row_key(ch, pch, bg, ba, row));
+        }
+        for (auto& [key, be] : m_tbl.sram_tx_map) {
+            auto& [ch, pch, bg, ba, row, cs] = key;
             m_bloom.insert(bank_row_key(ch, pch, bg, ba, row));
         }
         for (auto& [key, v] : m_tbl.ded_row_map) {
@@ -442,6 +535,8 @@ private:
     std::vector<BankKey4>  m_live_banks;
     std::map<BankKey4,int> m_dead_ordinal;
     int m_R = 0, m_num_live = 0, m_num_dead = 0, m_band_h = 0;
+    int m_cluster_banks_per_dead = 0;
+    LayerDMapping m_layer_d_mapping = LayerDMapping::SPREAD;
 
     bool           m_bloom_enabled = false;
     // true  = a Bloom reject is fast even when Layer D relocated the request

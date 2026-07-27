@@ -49,6 +49,9 @@ python3 tests/repair/test_offline_pipeline.py || rc=1
 echo; echo "== running ReqBuffer capacity regression =="
 ./tests/repair/test_req_buffer || rc=1
 
+echo; echo "== auditing additive interposer and lookup-overlap contract =="
+python3 tests/repair/test_interposer_contract.py || rc=1
+
 echo
 if [ "$rc" -eq 0 ]; then echo "ALL REPAIR TESTS PASSED"; else echo "SOME REPAIR TESTS FAILED"; fi
 exit $rc

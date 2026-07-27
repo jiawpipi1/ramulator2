@@ -9,18 +9,22 @@
 # Run this after ANY change to: the fault-map schema, the address mapping, the
 # DRAM org (esp. channel_width / column count), or repair_translator.h.
 #
-#   bash tests/repair/toy_dataflow/run_toy_dataflow.sh [remap_hbm_<id>.json]
+#   bash tests/repair/toy_dataflow/run_toy_dataflow.sh [remap_hbm_<id>.json] [spread|clustered]
 
 set -euo pipefail
 cd "$(dirname "$0")/../../.."          # -> ramulator2/
 
 RAM=./build_new/ramulator2
 JSON="${1:-/home/pitsaiyang/work/my_work/ramulator2/json/remap_hbm3_smoke.json}"
+DMAPPING="${2:-spread}"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 [ -x "$RAM" ] || { echo "FAIL: $RAM not built (cmake --build build_new -j)"; exit 1; }
 [ -f "$JSON" ] || { echo "FAIL: remap JSON not found: $JSON"; exit 1; }
+[[ "$DMAPPING" == "spread" || "$DMAPPING" == "clustered" ]] || {
+  echo "FAIL: Layer-D mapping must be spread or clustered"; exit 2;
+}
 
 # The DRAM org is DERIVED ENTIRELY from the table's own config block, so this test
 # works for ANY device -- HBM3, HBM4, or an arbitrary W2W stack -- with no edits.
@@ -51,7 +55,8 @@ echo "[toy] table  : $JSON"
 echo "[toy] device : $DESC   (org derived from the table's config block)"
 
 python3 tests/repair/toy_dataflow/make_toy_trace.py \
-  --json "$JSON" --trace "$TMP/toy.trace" --expect "$TMP/expect.json" --n 8
+  --json "$JSON" --trace "$TMP/toy.trace" --expect "$TMP/expect.json" --n 8 \
+  --d-mapping "$DMAPPING"
 
 cat > "$TMP/toy.yaml" <<EOF
 Frontend:
@@ -80,6 +85,7 @@ MemorySystem:
     RefreshManager: { impl: NoRefresh }
     RowPolicy: { impl: OpenRowPolicy }
     repair_table_path: $JSON
+    repair_d_mapping: $DMAPPING
     plugins:
   AddrMapper:
     impl: ChRaBaRoCo
